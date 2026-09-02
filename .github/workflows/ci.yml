@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push: { branches: [main] }
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          # better-sqlite3 aborts with no output on an older ABI, so the CLI refuses to start below 24.
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: node --test dist/__tests__/*.test.js
+      # Exercises the whole pipeline over real MCP stdio, without a Discord token.
+      - run: pnpm seed && pnpm smoke

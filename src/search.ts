@@ -89,6 +89,14 @@ function escapeLike(value: string): string {
   return value.replace(/[\\%_]/g, (c) => `\\${c}`);
 }
 
+/** Freshness of the least recently synced tier, so the answer never claims to be fresher than its stalest source. */
+function worstFreshness(tiers: TierDb[]) {
+  const all = tiers.map((t) => freshness(t.db));
+  const behind = all.filter((f) => f.minutes_behind !== null);
+  if (behind.length === 0) return all[0];
+  return behind.reduce((worst, f) => ((f.minutes_behind ?? 0) > (worst.minutes_behind ?? 0) ? f : worst));
+}
+
 function freshness(db: DB) {
   const row = db.prepare(`SELECT MAX(last_synced_at) AS ts FROM channels`).get() as { ts: number | null };
   if (row.ts === null) {
@@ -146,7 +154,7 @@ function keywordRanking(db: DB, query: string, filters: SearchFilters, limit: nu
 }
 
 interface VectorCache {
-  version: number;
+  version: string;
   rows: { id: number; vec: Float32Array }[];
 }
 const vectorCache = new Map<DB, VectorCache>();
@@ -156,10 +164,14 @@ const vectorCache = new Map<DB, VectorCache>();
  * embedded-window count plus the newest window id, which is enough to notice a sync.
  */
 function embeddedVectors(db: DB): { id: number; vec: Float32Array }[] {
-  const stamp = db
-    .prepare(`SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS top FROM windows WHERE embedding IS NOT NULL AND embed_model = ?`)
-    .get(config.embedModel) as { n: number; top: number };
-  const version = stamp.n * 1_000_003 + stamp.top;
+  // data_version changes whenever ANOTHER connection commits to this file, which is exactly the
+  // sync process. Counting rows cannot see an edit that re-embeds a window in place: the row count
+  // and the highest id both stay the same, and the cache would serve the pre-edit vector forever.
+  const [{ data_version: dataVersion }] = db.pragma("data_version") as { data_version: number }[];
+  const { n } = db
+    .prepare(`SELECT COUNT(*) AS n FROM windows WHERE embedding IS NOT NULL AND embed_model = ?`)
+    .get(config.embedModel) as { n: number };
+  const version = `${dataVersion}:${n}`;
 
   const cached = vectorCache.get(db);
   if (cached && cached.version === version) return cached.rows;
@@ -416,7 +428,16 @@ export async function search(
     };
   });
 
-  return { hits, freshness: freshness(db), mode_used: mode, notes, scope: scope.role, tiers: tiers.map((t) => t.tier) };
+  return {
+    hits,
+    // The oldest sync across every tier searched: reporting only the first tier's would call a
+    // result fresh while a secondary tier's sync was wedged.
+    freshness: worstFreshness(tiers),
+    mode_used: mode,
+    notes,
+    scope: scope.role,
+    tiers: tiers.map((t) => t.tier),
+  };
 }
 
 export function getContext(target: DB | TierDb[], messageId: string, before = 15, after = 15, scope: Scope = FULL_SCOPE) {

@@ -8,6 +8,8 @@ services:
       HTTP_HOST: 0.0.0.0
       DB_PATH: /app/data/index.db
       POLICY_FILE: /app/policy.yaml
+      # Caddy is the only route to this container, so the forwarded header is trustworthy here.
+      TRUST_PROXY: "true"
     volumes:
       - index-data:/app/data
       # Absolute path when the deployment keeps policy outside the source tree, so a code
@@ -35,7 +37,19 @@ services:
       disable: true
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - 'while true; do node dist/cli.js sync || echo "sync failed, retrying next cycle"; sleep "$$SYNC_INTERVAL_SECONDS"; done'
+      - |
+        fails=0
+        while true; do
+          if node dist/cli.js sync; then
+            fails=0
+          else
+            fails=$$((fails + 1))
+            # Loud and escalating: a silently retrying sync leaves the index frozen with no signal.
+            echo "SYNC FAILED ($$fails consecutive). The index is now stale; check sync_status." >&2
+            if [ "$$fails" -ge 3 ]; then sleep $$((SYNC_INTERVAL_SECONDS * 2)); fi
+          fi
+          sleep "$$SYNC_INTERVAL_SECONDS"
+        done
 
   caddy:
     image: caddy:2-alpine

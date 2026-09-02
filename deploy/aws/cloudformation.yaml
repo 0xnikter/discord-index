@@ -1,22 +1,22 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  discord-index - a searchable Discord index served over MCP. Provisions one EC2 instance with a
-  persistent EBS root volume, an Elastic IP, and Caddy for automatic HTTPS. Point your domain's A
+  discord-index - a searchable Discord index served over MCP. Provisions one EC2 instance with an
+  encrypted EBS root volume (deleted with the instance; the index is rebuilt by re-syncing), an Elastic IP, and Caddy for automatic HTTPS. Point your domain's A
   record at the Elastic IP shown in Outputs.
 
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label: {default: "Networking"}
-        Parameters: [VpcId, SubnetId, Domain, AllowedSshCidr]
+        Parameters: [VpcId, SubnetId, Domain, AllowedMcpCidr, AllowedPrefixListId, AllowedSshCidr, ExistingElasticIp]
       - Label: {default: "Discord"}
         Parameters: [DiscordToken, DiscordGuildId, IncludeThreads]
       - Label: {default: "MCP access"}
-        Parameters: [McpAuthToken]
+        Parameters: [McpAuthToken, RoleTokensJson, PolicyYaml]
       - Label: {default: "Embeddings (optional)"}
         Parameters: [OpenAiApiKey]
       - Label: {default: "Instance"}
-        Parameters: [InstanceType, VolumeSizeGb, RepoUrl]
+        Parameters: [InstanceType, VolumeSizeGb, SourceUrl, SourceBucket, SyncIntervalSeconds]
 
 Parameters:
   VpcId:
@@ -132,6 +132,15 @@ Conditions:
   RestrictByCidr: !And [!Condition HasDomain, !Not [!Condition UsePrefixList]]
   CreateEip: !Equals [!Ref ExistingElasticIp, ""]
   FromS3: !Not [!Equals [!Ref SourceBucket, ""]]
+
+Rules:
+  RestrictionRequired:
+    RuleCondition: !Not [!Equals [!Ref Domain, ""]]
+    Assertions:
+      - Assert: !Or
+          - !Not [!Equals [!Ref AllowedMcpCidr, ""]]
+          - !Not [!Equals [!Ref AllowedPrefixListId, ""]]
+        AssertDescription: Set exactly one of AllowedMcpCidr or AllowedPrefixListId, so port 443 is never left open to the internet.
 
 Resources:
   Secrets:
@@ -343,12 +352,14 @@ Resources:
 
               docker compose up -d --build
 
-              # Only report success once the server actually answers.
+              # Probe the app directly, not through Caddy: with a domain set, Caddy answers :80 with
+              # a 308 redirect for any Host, and curl without -L treats 308 as success - so this gate
+              # passed while the application container was crash-looping.
               for _ in $(seq 1 60); do
-                if curl -fsS http://127.0.0.1/healthz >/dev/null 2>&1; then break; fi
+                if docker compose exec -T discord-index node -e "fetch('http://127.0.0.1:8087/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1; then break; fi
                 sleep 5
               done
-              curl -fsS http://127.0.0.1/healthz >/dev/null
+              docker compose exec -T discord-index node -e "fetch('http://127.0.0.1:8087/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
               trap - ERR
               signal SUCCESS
             - SiteAddr: !If [HasDomain, !Ref Domain, ":80"]

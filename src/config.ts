@@ -55,8 +55,13 @@ export const config = {
   excludeCategoriesEnv: (process.env.EXCLUDE_CATEGORIES ?? "").split(",").map((c) => c.trim().toLowerCase()).filter(Boolean),
   excludeChannelsEnv: (process.env.EXCLUDE_CHANNELS ?? "").split(",").map((c) => c.trim().toLowerCase()).filter(Boolean),
   staleAfterMinutes: int("STALE_AFTER_MINUTES", 60),
-  /** Trust X-Forwarded-For for client identity. True behind the bundled Caddy; false if exposed directly. */
-  trustProxy: (process.env.TRUST_PROXY ?? "true") === "true",
+  /**
+   * Trust X-Forwarded-For for client identity. Off by default: the header is client-supplied, so
+   * trusting it without a proxy in front lets one caller mint unlimited identities and evade both
+   * the rate limit and the auth-failure lockout. The bundled compose file turns it on, because
+   * Caddy is then the only path in.
+   */
+  trustProxy: process.env.TRUST_PROXY === "true",
   httpHost: process.env.HTTP_HOST || "127.0.0.1",
   httpPort: int("HTTP_PORT", 8087),
 };

@@ -31,6 +31,29 @@ Discord API ──▶ SQLite (FTS5 + embeddings) ──▶ MCP ──▶ Claude
 
 On a real 59k-message server, a query takes well under a second.
 
+## What leaves your network, and what gets stored
+
+Read this before pointing it at a company server.
+
+- **Message text is sent to OpenAI** to be embedded — channel name, display names
+  and message bodies. That is how semantic search works. **Omit `OPENAI_API_KEY`
+  and nothing leaves your machine**: search falls back to keyword-only and says so
+  in every result.
+- **The index stores** message content, author name and id, timestamps, edits and
+  attachment metadata. Search is **attributed** — "what did Sam say about X" is a
+  first-class query. Everyone with a token can do that.
+- **DMs are never indexed.** The bot only ever sees guild channels and threads.
+- **The bot sees exactly what its Discord role sees.** Scope it there first: that
+  is the strongest control available, and it costs nothing.
+- **Deleted messages stay searchable until the next `sync --full`.** The
+  incremental cursor cannot see a deletion. Run a full sync on a schedule if that
+  matters to you.
+- **Write your `exclude:` rules before the first sync.** A first run with no
+  `--since` fetches the entire server history and embeds all of it. Adding an
+  exclusion later purges the index, but cannot un-send anything to OpenAI.
+- **Every tool call is logged** with role, client IP, arguments and result count.
+  Set `AUDIT_LOG_PATH` to keep it in a file.
+
 ## What makes the answers useful
 
 **It returns conversations, not matching lines.** A hit that says
@@ -71,31 +94,58 @@ You need a Discord bot with **View Channels** + **Read Message History** and the
 **Message Content** intent enabled. That intent is not optional: without it the
 API returns history with empty `content`.
 
+**Node 24+ and pnpm.** `better-sqlite3` aborts with no output on an older ABI, so
+the CLI refuses to start below 24. Note that some version managers hand
+`pnpm run` a *different* Node than the one you installed with — if a script trips
+the version check, call `node dist/cli.js` directly.
+
 ```bash
 pnpm install
-cp .env.example .env      # DISCORD_TOKEN, DISCORD_GUILD_ID, OPENAI_API_KEY
 pnpm build
+cp .env.example .env      # DISCORD_TOKEN, DISCORD_GUILD_ID, OPENAI_API_KEY
 node dist/cli.js sync --since 2026-06-01   # bounded first backfill
 claude mcp add discord-index -- node $PWD/dist/cli.js serve
 ```
 
-No bot token handy? See it work on example data first:
+Getting the Discord side right takes longer than the install:
+
+1. Create an app at [discord.com/developers](https://discord.com/developers/applications), add a bot, copy its token.
+2. **Bot → Privileged Gateway Intents → enable Message Content.** Without it the
+   API returns your history with empty `content` and the sync aborts.
+3. Invite it with **View Channels + Read Message History** and nothing else.
+   Denying Send Messages in the channel overrides is worth the extra minute.
+4. Enable Developer Mode in Discord, right-click the server, Copy ID.
+
+No bot token handy? See it work on example data, no Discord account needed:
 
 ```bash
-pnpm seed && pnpm smoke
+pnpm install && pnpm build && pnpm seed && pnpm smoke
 ```
 
 ## Deploying for a team
 
-**Anywhere with Docker** — the MCP server, a sync loop, and Caddy for TLS:
+**Anywhere with Docker** — the MCP server, a sync loop, and Caddy:
 
 ```bash
+cp .env.example .env
+# Required, or Caddy serves plain HTTP and your token crosses the wire in clear:
+echo 'SITE_ADDRESS=mcp.your-domain.com' >> .env
+echo "MCP_AUTH_TOKEN=$(openssl rand -hex 32)" >> .env
 docker compose up -d --build
 ```
 
+`SITE_ADDRESS` must be a hostname whose DNS already points at the box — Caddy
+gets a Let's Encrypt certificate for it on first request. Leaving it unset falls
+back to `:80`, which is fine only behind a proxy or tunnel that terminates TLS
+itself.
+
 **On AWS** — [`deploy/aws/cloudformation.yaml`](deploy/aws/cloudformation.yaml)
-provisions a Graviton instance, encrypted volume, Elastic IP, and automatic
-HTTPS. Secrets go to Secrets Manager, never into user-data.
+provisions a Graviton instance (~$20/month with the default `t4g.small`, volume
+and Elastic IP), and requires you to restrict port 443 to your own range or a
+CDN's, so the origin cannot be reached directly. It also sets up: encrypted
+volume, IMDSv2 required, SSH closed in favour of SSM Session Manager,
+`unattended-upgrades`, a non-root container, and secrets fetched from Secrets
+Manager at boot rather than baked into user-data.
 
 Either way, the HTTP transport **requires a bearer token and refuses to start
 without one**, so there's no way to accidentally publish your archive.
@@ -158,12 +208,37 @@ and a single-writer lock covers manual runs and container restarts.
 process. Comfortable to roughly 50k windows (~2.5M messages); past that, move the
 vectors to sqlite-vec or pgvector.
 
-**Deletions** are only reconciled by `sync --full`. Run it weekly.
+**Deletions** are only reconciled by `sync --full` — the incremental cursor
+cannot see them. Nothing automates this; schedule it if deleted content must
+actually disappear.
+
+**No backups.** The index is rebuildable by re-syncing, which is the reason
+there is no backup story — but a lost volume costs you a full backfill and
+re-embed.
+
+**One shared token has no revocation.** Issuing one role per person is supported
+today (one `tokenEnv` each) and is what you want if people leave.
 
 **Node 24+.** `better-sqlite3` aborts with no output on an older ABI, so the CLI
 refuses to start below 24. Some version managers hand `pnpm run` a different Node
 than the one you installed with — if a script fails the check, call
 `node dist/cli.js` directly.
+
+## Tests
+
+```bash
+node --test dist/__tests__/*.test.js   # access-control isolation
+pnpm seed && pnpm smoke                # whole pipeline over real MCP stdio, no token needed
+```
+
+The unit tests cover the property that must never regress quietly: that a role
+cannot reach a category it was denied — through search, through a reply chain
+that crosses the boundary, through `get_context` on a known id, or through
+`list_channels`. They also check that a denied id and a nonexistent one produce
+the *same* error, so the error itself cannot confirm the id exists.
+
+Use `node --test` rather than `pnpm test` if your version manager hands pnpm an
+older Node than the one you installed with.
 
 ## Ideas, bugs, "why does it do that"
 

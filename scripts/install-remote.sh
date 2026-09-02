@@ -26,17 +26,20 @@ cp deploy/discord-index-sync.service  ~/.config/systemd/user/
 cp deploy/discord-index-sync.timer    ~/.config/systemd/user/
 cp deploy/discord-index-mcp.service   ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now discord-index-sync.timer
-systemctl --user enable --now discord-index-mcp.service
+# Enabled but NOT started: .env does not exist yet, and the CLI exits on a missing token.
+systemctl --user enable discord-index-sync.timer
+systemctl --user enable discord-index-mcp.service
 # Keep the timer running when nobody is logged in.
 loginctl enable-linger \$USER || true
-systemctl --user status discord-index-mcp.service --no-pager | head -5
+echo "units installed and enabled, not yet started (they need .env)"
 REMOTE
 
 cat <<NOTE
 
 Next on ${HOST}:
-  1. scp your .env:   scp .env ${HOST}:${REMOTE_DIR}/.env
+  1. scp your .env, then start:
+       scp .env ${HOST}:${REMOTE_DIR}/.env
+       ssh ${HOST} 'systemctl --user start discord-index-mcp.service discord-index-sync.timer'
   2. first backfill:  ssh ${HOST} 'cd ${REMOTE_DIR} && node dist/cli.js sync --full'
   3. point an MCP client at it, e.g. openclaw:
        ssh ${HOST} "openclaw mcp set discord-index '{\"url\":\"http://127.0.0.1:8087/mcp\",\"transport\":\"streamable-http\"}'"

@@ -20,7 +20,8 @@
     "smoke": "node scripts/smoke.mjs",
     "fixture": "node scripts/fixture.mjs ./fixture",
     "deploy:remote": "bash scripts/install-remote.sh",
-    "seed": "node scripts/fixture.mjs ./fixture && node dist/cli.js sync --seed ./fixture"
+    "seed": "node scripts/fixture.mjs ./fixture && node dist/cli.js sync --seed ./fixture",
+    "test": "pnpm build && node --test dist/__tests__/*.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
