@@ -1,6 +1,9 @@
 # discord-index
 
-Ask questions about your team's Discord in plain language, from inside Claude.
+**Every message your team ever sent, searchable in about a second, from inside Claude.**
+
+Stop asking "didn't we discuss this somewhere?". Ask the question in plain
+language and get the actual conversation back, with links.
 
 ```
 you:  what did we decide about switching the queue backend?
@@ -11,6 +14,21 @@ you:  what did we decide about switching the queue backend?
    ada:   yes, and it gives us the retry semantics for free
    (+ the surrounding messages, with jump links)
 ```
+
+Measured on a real 3 year old server, not estimated:
+
+| | |
+|---|---|
+| **59,000 messages** | indexed across 371 channels |
+| **0.2 ms** | to search the index itself |
+| **~1 second** | end to end, almost all of it one API call to turn your question into a vector |
+| **$0.11** | one time cost to build the whole index |
+| **5 minutes** | how far behind it ever gets |
+| **$0 and 0.2 ms** | if you skip embeddings: keyword search only, nothing leaves your machine |
+
+It finds things you cannot grep for. Ask *"someone was unhappy about waiting too
+long"* and it returns a complaint about load times that shares not one word with
+your question.
 
 ## How it works, in one paragraph
 
