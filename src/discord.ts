@@ -110,7 +110,7 @@ export class DiscordClient {
         // Without a timeout a silently dropped socket leaves the promise pending forever, which
         // stalls a worker and, with enough workers, the whole run - observed as 0% CPU and no sockets.
         response = await fetch(`${API}${path}`, {
-          headers: { authorization: `Bot ${this.token}`, "user-agent": "discord-index (+https://github.com/discord-index)" },
+          headers: { authorization: `Bot ${this.token}`, "user-agent": "discord-index (+https://github.com/0xnikter/discord-index)" },
           signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         });
       } catch (error) {

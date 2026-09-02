@@ -21,7 +21,8 @@ your question.
 It does not query Discord when you ask. It keeps its own copy.
 
 A background job downloads your message history into a local SQLite database and
-re-syncs every 5 minutes. Questions are answered from that index.
+re-syncs on a schedule, every 5 minutes in the deployment below. Questions are
+answered from that index.
 
 ```
 Discord API ──(every 5 min)──▶ SQLite index ──(instant)──▶ your question
@@ -92,6 +93,18 @@ content, author, and timestamps. DMs are never touched.
 9. The bot sees every channel `@everyone` can see. Private channels stay hidden
    unless you add its role. Deny it anywhere it should not read before you sync.
 
+## Try it without a Discord bot
+
+Generated example data, so you can see what a result looks like before setting
+anything up. No Discord token needed, and no OpenAI key either (it falls back to
+keyword-only search and says so):
+
+```bash
+pnpm install && pnpm build
+pnpm seed          # writes example channels, then indexes them
+pnpm smoke         # runs every tool against that index
+```
+
 ## Step 2: run it
 
 Needs **Node 24+** and **pnpm**. `better-sqlite3` crashes silently on older Node,
@@ -100,7 +113,7 @@ so the CLI refuses to start below 24.
 ```bash
 pnpm install
 pnpm build
-cp .env.example .env      # DISCORD_TOKEN, DISCORD_GUILD_ID, OPENAI_API_KEY
+cp .env.example .env      # DISCORD_TOKEN, DISCORD_GUILD_ID, OPENAI_API_KEY (optional)
 ```
 
 Build the index, starting bounded so you see results in minutes:
@@ -109,6 +122,9 @@ Build the index, starting bounded so you see results in minutes:
 node dist/cli.js sync --since 2026-06-01
 node dist/cli.js channels          # confirm what the bot actually reached
 ```
+
+That is a one-time sync. Re-run it to refresh, or use the deployment below,
+which does it on a timer.
 
 Connect it:
 
