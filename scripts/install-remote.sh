@@ -10,8 +10,8 @@ REMOTE_DIR="discord-index"
 
 echo "==> syncing project to ${HOST}:~/${REMOTE_DIR}"
 rsync -az --delete \
-  --exclude node_modules --exclude dist --exclude data --exclude export \
-  --exclude vendor --exclude .git --exclude .env \
+  --exclude node_modules --exclude dist --exclude data \
+  --exclude .git --exclude .env --exclude policy.yaml \
   ./ "${HOST}:${REMOTE_DIR}/"
 
 echo "==> installing on ${HOST}"

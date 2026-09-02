@@ -315,12 +315,16 @@ Resources:
               umask 077
               # Access policy travels with the stack: it lives outside the public repo, so cloning
               # the source alone would silently index channels the policy excludes.
-              cat > policy.yaml <<'POLICYEOF'
+              # Written OUTSIDE /opt/discord-index: that directory is replaced wholesale by a code
+              # update, which would silently drop the roles and fall back to a single full-access token.
+              mkdir -p /etc/discord-index
+              cat > /etc/discord-index/policy.yaml <<'POLICYEOF'
               ${PolicyYaml}
               POLICYEOF
 
               cat > .env <<ENVEOF
               POLICY_FILE=/app/policy.yaml
+              POLICY_HOST_PATH=/etc/discord-index/policy.yaml
               DISCORD_GUILD_ID=${DiscordGuildId}
               INCLUDE_THREADS=${IncludeThreads}
               SYNC_INTERVAL_SECONDS=${SyncIntervalSeconds}

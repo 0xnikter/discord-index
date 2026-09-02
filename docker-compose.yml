@@ -10,7 +10,9 @@ services:
       POLICY_FILE: /app/policy.yaml
     volumes:
       - index-data:/app/data
-      - ./policy.yaml:/app/policy.yaml:ro
+      # Absolute path when the deployment keeps policy outside the source tree, so a code
+      # update cannot overwrite it. Defaults to the repo copy for local use.
+      - ${POLICY_HOST_PATH:-./policy.yaml}:/app/policy.yaml:ro
     expose:
       - "8087"
 
@@ -26,7 +28,9 @@ services:
       SYNC_INTERVAL_SECONDS: "${SYNC_INTERVAL_SECONDS:-300}"
     volumes:
       - index-data:/app/data
-      - ./policy.yaml:/app/policy.yaml:ro
+      # Absolute path when the deployment keeps policy outside the source tree, so a code
+      # update cannot overwrite it. Defaults to the repo copy for local use.
+      - ${POLICY_HOST_PATH:-./policy.yaml}:/app/policy.yaml:ro
     healthcheck:
       disable: true
     entrypoint: ["/bin/sh", "-c"]
