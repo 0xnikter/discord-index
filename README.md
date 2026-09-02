@@ -141,7 +141,7 @@ What the stack does and does not protect:
 |---|---|
 | SSH | **Closed by default** — no ingress rule unless you set `AllowedSshCidr`. Shell access is SSM Session Manager. `fail2ban` is installed to guard `sshd` if you do open it. |
 | MCP endpoint | Bearer token, plus a per-IP limiter: 300 req/min, and 10 failed auths in 5 minutes locks the IP out for the rest of the window (`429` + `Retry-After`). Rejections are logged with the client IP. |
-| Network | `AllowedMcpCidr` is **required** — there is no permissive default. Use `0.0.0.0/0` only behind a CDN or tunnel. |
+| Network | 443 is restricted to `AllowedMcpCidr` or, behind a CDN, to `AllowedPrefixListId` holding the CDN's ranges — otherwise anyone who finds the origin IP bypasses the CDN entirely. Port 80 stays open because Let's Encrypt validates from its own servers, not the CDN; it serves only the ACME challenge and a redirect. |
 | OS | `unattended-upgrades` enabled at boot. |
 | Secrets | Held in Secrets Manager and fetched at boot by the instance role — **never written into user-data**, which any process on the box can read via IMDS and which persists for the life of the instance. |
 | Metadata | IMDSv2 required (`HttpTokens: required`) with `HttpPutResponseHopLimit: 1`, so an SSRF in the app cannot reach user-data or the role credentials. |
