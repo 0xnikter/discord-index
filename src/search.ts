@@ -49,6 +49,8 @@ export interface SearchResult {
   scope: string;
   /** Tier databases actually searched. */
   tiers: string[];
+  /** Set when the response was trimmed to fit the size budget; `notes` says what was dropped. */
+  truncated?: boolean;
 }
 
 const RRF_K = 60;
@@ -566,4 +568,78 @@ function syncStatusIn(db: DB, scope: Scope = FULL_SCOPE): TierStatus {
         }
       : null,
   };
+}
+
+/** Unmatched messages kept on each side of a hit's matched span, tried largest-first. */
+const CONTEXT_ALLOWANCES = [12, 6, 3, 1, 0];
+
+/** Contiguous slice around the matched span, so a trimmed hit still reads as a conversation. */
+function trimHit(hit: SearchHit, allowance: number): SearchHit {
+  const first = hit.messages.findIndex((m) => m.matched);
+  if (first === -1) return { ...hit, messages: hit.messages.slice(0, allowance * 2 + 1) };
+  let last = first;
+  for (let i = hit.messages.length - 1; i > first; i--) {
+    if (hit.messages[i].matched) { last = i; break; }
+  }
+  return {
+    ...hit,
+    messages: hit.messages.slice(Math.max(0, first - allowance), Math.min(hit.messages.length, last + allowance + 1)),
+  };
+}
+
+/**
+ * Shrink a result to fit `maxChars`. A client rejects an oversized response outright, so an
+ * untrimmed `wide` search over many hits returns nothing at all - trimming is what makes it answer.
+ *
+ * Order of sacrifice: surrounding context first (uniformly, so ranking is not distorted), then whole
+ * hits from the bottom. Matched messages are never dropped from a surviving hit, except in the last
+ * resort where one hit alone overflows. The top hit always survives.
+ */
+export function fitToBudget(result: SearchResult, maxChars: number): SearchResult {
+  // Must measure the exact string the transport sends: indented JSON runs ~25% larger, and a budget
+  // computed on the compact form leaves the real response over the limit.
+  const size = (r: SearchResult) => JSON.stringify(r, null, 2).length;
+  if (size(result) <= maxChars) return result;
+
+  const originalHits = result.hits.length;
+  const originalMessages = result.hits.reduce((n, h) => n + h.messages.length, 0);
+  const report = (hits: SearchHit[]): SearchResult => {
+    const keptMessages = hits.reduce((n, h) => n + h.messages.length, 0);
+    const dropped = originalHits - hits.length;
+    return {
+      ...result,
+      hits,
+      truncated: true,
+      notes: [
+        ...result.notes,
+        `Response trimmed to fit the size limit: ${keptMessages} of ${originalMessages} messages` +
+          (dropped > 0 ? ` and ${hits.length} of ${originalHits} conversations` : "") +
+          ". Narrow the query, lower `limit`, or call get_context on a jump_url to read a full conversation.",
+      ],
+    };
+  };
+
+  for (const allowance of CONTEXT_ALLOWANCES) {
+    const candidate = report(result.hits.map((h) => trimHit(h, allowance)));
+    if (size(candidate) <= maxChars) return candidate;
+  }
+
+  // Even matched-only text overflows: drop hits from the bottom, but never return zero hits.
+  const floor = result.hits.map((h) => trimHit(h, 0));
+  for (let keep = floor.length - 1; keep >= 1; keep--) {
+    const candidate = report(floor.slice(0, keep));
+    if (size(candidate) <= maxChars) return candidate;
+  }
+
+  // One hit whose matched messages alone overflow. Keep the earliest that fit rather than fail the
+  // call; this is the only path that drops a matched message, and `truncated` reports it.
+  const [top] = floor;
+  let lo = 0;
+  let hi = top.messages.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (size(report([{ ...top, messages: top.messages.slice(0, mid) }])) <= maxChars) lo = mid;
+    else hi = mid - 1;
+  }
+  return report([{ ...top, messages: top.messages.slice(0, lo) }]);
 }

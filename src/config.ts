@@ -56,6 +56,11 @@ export const config = {
   excludeChannelsEnv: (process.env.EXCLUDE_CHANNELS ?? "").split(",").map((c) => c.trim().toLowerCase()).filter(Boolean),
   staleAfterMinutes: int("STALE_AFTER_MINUTES", 60),
   /**
+   * Character ceiling for one MCP tool response. Clients reject an oversized result outright, so a
+   * `wide` search over many hits would return nothing at all rather than something trimmed.
+   */
+  maxResponseChars: int("MAX_RESPONSE_CHARS", 40_000),
+  /**
    * Trust X-Forwarded-For for client identity. Off by default: the header is client-supplied, so
    * trusting it without a proxy in front lets one caller mint unlimited identities and evade both
    * the rate limit and the auth-failure lockout. The bundled compose file turns it on, because

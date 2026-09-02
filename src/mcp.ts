@@ -5,12 +5,32 @@ import { createServer } from "node:http";
 import { z } from "zod";
 import { config } from "./config.js";
 import { openDb, tierDbPath, type DB } from "./db.js";
-import { getContext, listChannels, search, syncStatus, type ContextLevel, type SearchMode, type TierDb } from "./search.js";
+import { fitToBudget, getContext, listChannels, search, syncStatus, type ContextLevel, type SearchMode, type TierDb } from "./search.js";
 import { checkRequest, clientIp, isLockedOut, recordAuthFailure } from "./rate-limit.js";
 import { DEFAULT_TIER, FULL_SCOPE, loadRoles, resolveRole, scopeFor, type Role, type Scope } from "./roles.js";
 import { audit, auditArgs } from "./audit.js";
 
-const json = (value: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] });
+/**
+ * Clients reject an oversized tool result outright, so an unbudgeted response is not "verbose", it
+ * is a failed call. Structured results are trimmed by `fitToBudget` before they reach here; this is
+ * the last-resort guard for everything else.
+ */
+const json = (value: unknown) => {
+  const text = JSON.stringify(value, null, 2);
+  if (text.length <= config.maxResponseChars) return { content: [{ type: "text" as const, text }] };
+  const compact = JSON.stringify(value);
+  if (compact.length <= config.maxResponseChars) return { content: [{ type: "text" as const, text: compact }] };
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text:
+          compact.slice(0, config.maxResponseChars) +
+          `\n\n[truncated at ${config.maxResponseChars} characters of ${compact.length}; narrow the request]`,
+      },
+    ],
+  };
+};
 const fail = (error: unknown) => ({
   content: [{ type: "text" as const, text: `Error: ${error instanceof Error ? error.message : String(error)}` }],
   isError: true,
@@ -67,7 +87,10 @@ export function buildServer(scope: Scope = FULL_SCOPE, ip = "local", tierNames: 
     },
     async ({ query, channel, author, after, before, mode, limit, context }) => {
       try {
-        const result = await search(db, query, { channel, author, after, before }, { mode: mode as SearchMode, limit, scope, context: context as ContextLevel });
+        const result = fitToBudget(
+          await search(db, query, { channel, author, after, before }, { mode: mode as SearchMode, limit, scope, context: context as ContextLevel }),
+          config.maxResponseChars,
+        );
         audit({ tool: "search_messages", role: scope.role, ip, args: auditArgs({ query, channel, author, after, before, mode, limit, context }), resultCount: result.hits.length });
         return json(result);
       } catch (error) {
