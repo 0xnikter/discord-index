@@ -1,9 +1,9 @@
 /**
  * Discord message fetcher.
  *
- * The measured ceiling is 50 req/s globally and
- * 5 req/s per channel (x-ratelimit-limit 5 / reset-after 1s), against ~530 ms of latency per call —
- * so throughput comes from fetching many channels concurrently, not from hammering one.
+ * Measured: every channel shares ONE rate-limit bucket at 5 requests/second
+ * (x-ratelimit-limit 5 / reset-after 1s), against ~530 ms latency per call. Concurrency hides the
+ * latency but cannot raise the ceiling, so the limiter is set just below it.
  */
 import { setTimeout as sleep } from "node:timers/promises";
 
@@ -34,6 +34,8 @@ export interface FetchedMessage {
 
 /** Numeric channel types we can read message history from. Categories and voice are skipped. */
 const TEXTUAL_TYPES = new Set([0, 5, 10, 11, 12, 15]);
+/** Discord thread channel types, as stored in `channels.type`. */
+export const THREAD_TYPES = new Set(["10", "11", "12"]);
 const CATEGORY_TYPE = 4;
 /** DEFAULT and REPLY. Everything else is a system notification carrying no searchable knowledge. */
 const CONTENT_TYPES = new Set([0, 19]);
@@ -67,8 +69,6 @@ class RateLimiter {
 interface Bucket {
   remaining: number;
   resetAt: number;
-  /** Serializes requests sharing a bucket: Discord's counters are shared, so parallel calls race. */
-  chain: Promise<void>;
 }
 
 export class DiscordClient {
@@ -121,12 +121,13 @@ export class DiscordClient {
       }
 
       const bucketHash = response.headers.get("x-ratelimit-bucket");
-      if (bucketHash) {
+      const remainingHeader = response.headers.get("x-ratelimit-remaining");
+      const resetHeader = response.headers.get("x-ratelimit-reset-after");
+      if (bucketHash && remainingHeader !== null && resetHeader !== null) {
         this.routeBucket.set(route, bucketHash);
         this.buckets.set(bucketHash, {
-          remaining: Number(response.headers.get("x-ratelimit-remaining") ?? "1"),
-          resetAt: Date.now() + Number(response.headers.get("x-ratelimit-reset-after") ?? "1") * 1000,
-          chain: Promise.resolve(),
+          remaining: Number(remainingHeader),
+          resetAt: Date.now() + Number(resetHeader) * 1000,
         });
       }
 
@@ -169,7 +170,7 @@ export class DiscordClient {
   }
 
   /** Readable channels plus active threads, each resolved to its category. */
-  async listChannels(guildId: string, includeThreads: boolean): Promise<FetchedChannel[]> {
+  async listChannels(guildId: string, threads: "None" | "Active" | "All"): Promise<FetchedChannel[]> {
     const raw = await this.request<
       { id: string; name: string; type: number; topic?: string | null; parent_id?: string | null }[]
     >(`/guilds/${guildId}/channels`, `guild:${guildId}`);
@@ -189,13 +190,24 @@ export class DiscordClient {
         categoryName: c.parent_id ? (categories.get(c.parent_id) ?? null) : null,
       }));
 
-    if (!includeThreads) return channels;
+    if (threads === "None") return channels;
 
-    const active = await this.request<{ threads: { id: string; name: string; type: number; parent_id: string }[] }>(
-      `/guilds/${guildId}/threads/active`,
-      `guild:${guildId}`,
-    );
-    for (const thread of active?.threads ?? []) {
+    const active = await this.request<{ threads: RawThread[] }>(`/guilds/${guildId}/threads/active`, `guild:${guildId}`);
+    const found: RawThread[] = [...(active?.threads ?? [])];
+
+    if (threads === "All") {
+      // Archived threads live behind a per-channel endpoint, so "All" costs one request per parent
+      // channel on top of the active list.
+      for (const parent of channels) {
+        const archived = await this.request<{ threads: RawThread[] }>(
+          `/channels/${parent.id}/threads/archived/public?limit=100`,
+          `threads:${parent.id}`,
+        );
+        found.push(...(archived?.threads ?? []));
+      }
+    }
+
+    for (const thread of found) {
       // A thread's category is its parent channel's category.
       const parent = byId.get(thread.parent_id);
       const categoryId = parent?.parent_id ?? null;
@@ -216,7 +228,7 @@ export class DiscordClient {
    * is what makes an incremental sync cost one request for a quiet channel.
    * Returns null when the channel is not readable by this bot.
    */
-  async fetchMessages(channelId: string, after?: string): Promise<FetchedMessage[] | null> {
+  async fetchMessages(channelId: string, after?: string): Promise<{ messages: FetchedMessage[]; truncated: boolean } | null> {
     const collected: FetchedMessage[] = [];
     let reachable = true;
 
@@ -262,9 +274,18 @@ export class DiscordClient {
     }
 
     collected.sort((a, b) => a.timestamp - b.timestamp);
-    if (!reachable && collected.length === 0) return null;
-    return collected;
+    // A permission change partway through pagination leaves a partial channel. Saying so is the
+    // difference between "synced" and "synced what it could reach".
+    if (!reachable) return collected.length === 0 ? null : { messages: collected, truncated: true };
+    return { messages: collected, truncated: false };
   }
+}
+
+interface RawThread {
+  id: string;
+  name: string;
+  type: number;
+  parent_id: string;
 }
 
 interface RawMessage {

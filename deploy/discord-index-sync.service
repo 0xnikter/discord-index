@@ -1,5 +1,5 @@
 [Unit]
-Description=discord-index sync (DiscordChatExporter -> SQLite FTS5 + embeddings)
+Description=discord-index sync (Discord API -> SQLite FTS5 + embeddings)
 After=network-online.target
 Wants=network-online.target
 

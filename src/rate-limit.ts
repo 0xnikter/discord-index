@@ -19,7 +19,12 @@ const failures = new Map<string, Window>();
 
 function record(store: Map<string, Window>, key: string, windowMs: number): number {
   const now = Date.now();
-  if (store.size > MAX_TRACKED_IPS) store.clear();
+  // Evict a single oldest entry. Clearing the whole map let one caller flood it with forged
+  // X-Forwarded-For values to wipe everyone else's counters, including their own lockout.
+  if (store.size > MAX_TRACKED_IPS) {
+    const oldest = store.keys().next();
+    if (!oldest.done) store.delete(oldest.value);
+  }
   const entry = store.get(key) ?? { hits: [] };
   entry.hits = entry.hits.filter((t) => now - t < windowMs);
   entry.hits.push(now);
@@ -41,8 +46,10 @@ export function clientIp(headers: Record<string, string | string[] | undefined>,
   if (trustProxy) {
     const forwarded = headers["x-forwarded-for"];
     const raw = Array.isArray(forwarded) ? forwarded[0] : forwarded;
-    const first = raw?.split(",")[0]?.trim();
-    if (first) return first;
+    // The LAST hop is the one the trusted proxy appended. Earlier entries are client-supplied and
+    // forgeable, so keying on the first would let one caller mint unlimited identities.
+    const hops = raw?.split(",").map((h) => h.trim()).filter(Boolean);
+    if (hops && hops.length > 0) return hops[hops.length - 1];
   }
   return socketAddr ?? "unknown";
 }

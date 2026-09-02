@@ -39,17 +39,22 @@ export const config = {
   dbPath: resolve(process.env.DB_PATH || "./data/index.db"),
   /** Channels fetched concurrently. One channel is capped at ~2 req/s by latency, so fan out. */
   fetchConcurrency: int("FETCH_CONCURRENCY", 6),
-  /** Global request budget. Discord's bot ceiling is ~50/s; staying under it avoids ban risk. */
-  requestsPerSecond: int("DISCORD_REQUESTS_PER_SECOND", 8),
+  /** All channels share one bucket (measured 5 req/s), so this is the real ceiling, not ~50/s. */
+  requestsPerSecond: int("DISCORD_REQUESTS_PER_SECOND", 4),
   syncOverlapMinutes: int("SYNC_OVERLAP_MINUTES", 15),
-  includeThreads: process.env.INCLUDE_THREADS || "Active",
-  policyFile: process.env.POLICY_FILE ?? "",
+  includeThreads: ((): "None" | "Active" | "All" => {
+    const raw = process.env.INCLUDE_THREADS || "Active";
+    // Reject an unrecognised value rather than quietly falling back: a typo used to enable threads
+    // and "All" used to behave exactly like "Active", both without a word to the operator.
+    if (raw !== "None" && raw !== "Active" && raw !== "All") {
+      throw new Error(`INCLUDE_THREADS must be None, Active or All, got "${raw}"`);
+    }
+    return raw;
+  })(),
   /** Env overrides for the policy file's `exclude:` block; the union of both is applied. */
   excludeCategoriesEnv: (process.env.EXCLUDE_CATEGORIES ?? "").split(",").map((c) => c.trim().toLowerCase()).filter(Boolean),
   excludeChannelsEnv: (process.env.EXCLUDE_CHANNELS ?? "").split(",").map((c) => c.trim().toLowerCase()).filter(Boolean),
   staleAfterMinutes: int("STALE_AFTER_MINUTES", 60),
-  /** Required for the HTTP transport. There is no unauthenticated HTTP mode. */
-  authToken: process.env.MCP_AUTH_TOKEN ?? "",
   /** Trust X-Forwarded-For for client identity. True behind the bundled Caddy; false if exposed directly. */
   trustProxy: (process.env.TRUST_PROXY ?? "true") === "true",
   httpHost: process.env.HTTP_HOST || "127.0.0.1",

@@ -21,10 +21,10 @@ COPY --from=build /app/dist ./dist
 COPY --from=build /app/scripts ./scripts
 COPY package.json ./
 # data/ and export/ are mounted; keeping the index on a volume is the whole point.
-RUN mkdir -p /app/data /app/export && chown -R node:node /app
+RUN mkdir -p /app/data && chown -R node:node /app
 USER node
 VOLUME ["/app/data"]
-ENV DB_PATH=/app/data/index.db EXPORT_DIR=/app/export HTTP_HOST=0.0.0.0 HTTP_PORT=8087
+ENV DB_PATH=/app/data/index.db HTTP_HOST=0.0.0.0 HTTP_PORT=8087
 EXPOSE 8087
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
   CMD node -e "fetch('http://127.0.0.1:8087/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"

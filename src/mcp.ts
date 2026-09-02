@@ -4,7 +4,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { createServer } from "node:http";
 import { z } from "zod";
 import { config } from "./config.js";
-import { openDb, tierDbPath } from "./db.js";
+import { openDb, tierDbPath, type DB } from "./db.js";
 import { getContext, listChannels, search, syncStatus, type ContextLevel, type SearchMode, type TierDb } from "./search.js";
 import { checkRequest, clientIp, isLockedOut, recordAuthFailure } from "./rate-limit.js";
 import { DEFAULT_TIER, FULL_SCOPE, loadRoles, resolveRole, scopeFor, type Role, type Scope } from "./roles.js";
@@ -16,9 +16,21 @@ const fail = (error: unknown) => ({
   isError: true,
 });
 
-/** Opens only the tiers a role may read: an unreadable tier's file is never touched. */
+/**
+ * Opens only the tiers a role may read: an unreadable tier's file is never touched.
+ * Handles are cached per tier for the life of the process - buildServer runs once per HTTP request,
+ * so opening a fresh connection each time leaked a file descriptor and ~5 MB per request.
+ */
+const tierHandles = new Map<string, DB>();
 function openTiers(tierNames: string[]): TierDb[] {
-  return tierNames.map((tier) => ({ tier, db: openDb(tierDbPath(tier)) }));
+  return tierNames.map((tier) => {
+    let db = tierHandles.get(tier);
+    if (!db) {
+      db = openDb(tierDbPath(tier));
+      tierHandles.set(tier, db);
+    }
+    return { tier, db };
+  });
 }
 
 export function buildServer(scope: Scope = FULL_SCOPE, ip = "local", tierNames: string[] = [DEFAULT_TIER]): McpServer {
@@ -137,8 +149,8 @@ export async function serveHttp(): Promise<void> {
   // Refuse rather than serve the whole archive unauthenticated. Use stdio for local, token-free use.
   if (roles.length === 0) {
     throw new Error(
-      "No access configured. Set MCP_AUTH_TOKEN (>=16 chars) for single-token access, or MCP_ROLES / " +
-        "MCP_ROLES_FILE for role-scoped access. The stdio transport needs neither.",
+      "No access configured. Set MCP_AUTH_TOKEN (>=16 chars) for single-token access, or point " +
+        "POLICY_FILE at a policy.yaml for role-scoped access. The stdio transport needs neither.",
     );
   }
   process.stderr.write(`roles configured: ${roles.map((r) => r.name).join(", ")}\n`);

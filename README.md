@@ -2,15 +2,13 @@
 
 Searchable index over a Discord server, exposed to Claude as MCP tools.
 
-Discord's message-search endpoint is closed to bots, so no MCP server that talks to the Discord API
-live can offer real search — the ceiling is 100 messages per call, one channel at a time. This project
-gets around that by keeping a local index: [DiscordChatExporter][dce] pulls the messages, SQLite FTS5 +
-OpenAI embeddings rank them, and a small MCP server serves four tools.
-
-[dce]: https://github.com/Tyrrrz/DiscordChatExporter
+Discord's message-search endpoint is closed to bots, so no MCP server that queries the Discord API
+live can offer real search: the ceiling is 100 messages per call, one channel at a time. This project
+keeps a local index instead. It fetches messages itself, ranks them with SQLite FTS5 + OpenAI
+embeddings, and serves four MCP tools.
 
 ```
-Discord ──DCE exportguild --after──▶ export/*.json ──▶ SQLite (FTS5 + embeddings) ──▶ MCP ──▶ Claude
+Discord API ──▶ SQLite (FTS5 + embeddings) ──▶ MCP ──▶ Claude
 ```
 
 ## MCP tools
@@ -26,7 +24,6 @@ Discord ──DCE exportguild --after──▶ export/*.json ──▶ SQLite (F
 
 ```bash
 pnpm install
-pnpm fetch-dce                 # self-contained DCE binary, no .NET or Docker needed
 cp .env.example .env           # fill in DISCORD_TOKEN + DISCORD_GUILD_ID
 pnpm build
 node dist/cli.js sync --since 2026-06-01   # bounded first backfill; drop --since for all history
@@ -52,8 +49,8 @@ makes brute-force cosine viable without a vector database.
 find concepts. The two rankings are combined with Reciprocal Rank Fusion, so BM25 and cosine never
 have to be put on a common scale. `mode: "keyword"` or `"semantic"` forces one side.
 
-**Incremental sync.** `--after` is a real server-side cursor, so a quiet channel costs exactly one
-Discord request per run. An unchanged open window keeps its embedding across syncs (matched by content
+**Incremental sync.** The cursor is a Discord snowflake, so a quiet channel costs exactly one
+request per run. An unchanged open window keeps its embedding across syncs (matched by content
 hash), so an idle server costs zero embedding calls.
 
 **Freshness is explicit.** Every search result carries a `freshness` block, and a stale index says so
@@ -80,12 +77,13 @@ the windowing rules without touching Discord, re-billing only the embeddings.
 **Run `sync --full` weekly.** The incremental cursor filters on message id, so it never revisits an
 old message that was edited or notices one that was deleted. The weekly full pass repairs both.
 
-**Cadence.** With ~40 channels a run costs ~41 Discord requests — about 0.14 req/s against a 50 req/s
-bot limit, so even a 5-minute timer is far below any threshold. 30 minutes is the default and is
-usually plenty for a knowledge index.
+**Cadence.** All channels share ONE Discord rate-limit bucket (measured: 5 requests/second), so a
+full incremental pass is roughly one request per channel at ~4 req/s. `SYNC_INTERVAL_SECONDS`
+defaults to 300; the interval is measured from the END of the previous run, so runs never overlap.
 
-**Keep `INCLUDE_THREADS=Active`.** `All` re-checks every archived thread on every run — archived
-threads never change, and a server with hundreds of them turns a 41-request sync into a 500-request one.
+**Keep `INCLUDE_THREADS=Active`.** `All` also lists archived threads, which costs one extra request
+per parent channel on every run for content that never changes. Use it for a one-off backfill, then
+switch back.
 
 **Embedding cost.** `text-embedding-3-small` at $0.02/1M tokens. A 200k-message backfill is roughly
 6M tokens (~$0.12); steady-state incremental syncs are a fraction of a cent. Without `OPENAI_API_KEY`
@@ -133,7 +131,7 @@ cp .env.example .env    # set DISCORD_TOKEN, DISCORD_GUILD_ID, MCP_AUTH_TOKEN, D
 docker compose up -d --build
 ```
 
-Three services: the MCP server, a sync loop (`SYNC_INTERVAL_SECONDS`, default 1800), and Caddy.
+Three services: the MCP server, a sync loop (`SYNC_INTERVAL_SECONDS`, default 300), and Caddy.
 
 ### Hardening
 

@@ -2,34 +2,9 @@ import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { config } from "./config.js";
+import { DEFAULT_TIER } from "./roles.js";
 
 export type DB = Database.Database;
-
-export interface MessageRow {
-  id: string;
-  channel_id: string;
-  author_id: string;
-  author_name: string;
-  content: string;
-  ts: number;
-  edited_ts: number | null;
-  jump_url: string;
-  attachments: string;
-  window_id: number | null;
-}
-
-export interface WindowRow {
-  id: number;
-  channel_id: string;
-  start_ts: number;
-  end_ts: number;
-  msg_count: number;
-  text: string;
-  text_hash: string;
-  is_open: number;
-  embedding: Buffer | null;
-  embed_model: string | null;
-}
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS channels (
@@ -84,7 +59,7 @@ CREATE TABLE IF NOT EXISTS windows (
   embed_model TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_windows_channel ON windows(channel_id, start_ts);
-CREATE INDEX IF NOT EXISTS idx_windows_open    ON windows(is_open);
+CREATE INDEX IF NOT EXISTS idx_windows_chan_open ON windows(channel_id, is_open);
 
 CREATE TABLE IF NOT EXISTS sync_runs (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,7 +75,7 @@ CREATE TABLE IF NOT EXISTS sync_runs (
 /** Database file for a tier. Tiers are separate files, so a tier a role cannot read is never opened. */
 export function tierDbPath(tier: string): string {
   const base = config.dbPath.replace(/\.db$/, "");
-  return tier === "common" ? `${base}.db` : `${base}.${tier}.db`;
+  return tier === DEFAULT_TIER ? `${base}.db` : `${base}.${tier}.db`;
 }
 
 /**
@@ -112,13 +87,20 @@ const MIGRATIONS: { table: string; column: string; ddl: string }[] = [
   { table: "messages", column: "reply_to", ddl: "ALTER TABLE messages ADD COLUMN reply_to TEXT" },
 ];
 
+/** Indexes that must exist regardless of when the database was first created. */
+const INDEXES: string[] = [
+  "CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(reply_to)",
+  "CREATE INDEX IF NOT EXISTS idx_channels_category ON channels(category_id)",
+  "CREATE INDEX IF NOT EXISTS idx_windows_chan_open ON windows(channel_id, is_open)",
+  "DROP INDEX IF EXISTS idx_windows_open",
+];
+
 function migrate(db: DB): void {
   for (const { table, column, ddl } of MIGRATIONS) {
     const exists = (db.pragma(`table_info(${table})`) as { name: string }[]).some((c) => c.name === column);
     if (!exists) db.exec(ddl);
   }
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(reply_to)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_channels_category ON channels(category_id)`);
+  for (const ddl of INDEXES) db.exec(ddl);
 }
 
 export function openDb(path: string = config.dbPath): DB {

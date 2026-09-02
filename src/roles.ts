@@ -38,6 +38,7 @@ export interface Scope {
 }
 
 export const DEFAULT_TIER = "common";
+const MIN_TOKEN_LENGTH = 16;
 
 const FULL_ACCESS: Omit<Role, "token"> = { name: "full", tiers: [DEFAULT_TIER], denyCategories: [], denyChannels: [] };
 
@@ -107,13 +108,15 @@ function parseRoles(doc: PolicyDoc, path: string, env: NodeJS.ProcessEnv): Role[
     if (r.tokenEnv && token === undefined) {
       throw new Error(`${path}: role "${r.name}" needs ${r.tokenEnv} to be set in the environment`);
     }
-    if (!token || token.length < 16) {
-      throw new Error(`${path}: role "${r.name}" needs a token of at least 16 characters`);
-    }
+    assertUsableToken(token, `${path}: role "${r.name}"`);
     // Reading nothing is a configuration mistake, not a valid role; say so rather than serving
     // a role that silently returns no results forever.
     const tiers = r.tiers ?? [DEFAULT_TIER];
     if (tiers.length === 0) throw new Error(`${path}: role "${r.name}" lists no tiers`);
+    // An empty allow list reads as "allow nothing" but used to mean "no restriction at all".
+    if (r.allowCategories && r.allowCategories.length === 0) {
+      throw new Error(`${path}: role "${r.name}" has an empty allowCategories; remove it, or list the categories it may read`);
+    }
     return {
       name: r.name,
       token,
@@ -126,10 +129,6 @@ function parseRoles(doc: PolicyDoc, path: string, env: NodeJS.ProcessEnv): Role[
 }
 
 /**
- * Policy comes from a file that carries no secrets (tokens are named, not embedded), so it can be
- * committed and reviewed. Falls back to a single full-access token for simple deployments.
- */
-/**
  * Index-time exclusions only. Deliberately does NOT resolve role tokens: the sync process needs the
  * exclude rules but must never be handed every role's credentials just to read them.
  */
@@ -140,7 +139,10 @@ export function loadExclusions(env: NodeJS.ProcessEnv = process.env): { categori
   return { categories: doc.exclude?.categories ?? [], channels: doc.exclude?.channels ?? [] };
 }
 
-/** Roles and their tokens. Only the server that answers requests needs these. */
+/**
+ * Roles and their tokens. Policy carries no secrets - tokens are named, not embedded - so the file
+ * can be committed and reviewed. Falls back to a single full-access token when there is no policy.
+ */
 export function loadRoles(env: NodeJS.ProcessEnv = process.env): Role[] {
   const file = env.POLICY_FILE;
   // A policy file with no `roles:` block is valid: it may exist only to carry exclude rules, and
@@ -150,7 +152,16 @@ export function loadRoles(env: NodeJS.ProcessEnv = process.env): Role[] {
     if (doc.roles !== undefined) return parseRoles(doc, file, env);
   }
   const token = env.MCP_AUTH_TOKEN ?? "";
-  return token ? [{ ...FULL_ACCESS, token }] : [];
+  if (!token) return [];
+  assertUsableToken(token, "MCP_AUTH_TOKEN");
+  return [{ ...FULL_ACCESS, token }];
+}
+
+/** One rule for every path: the policy file enforced it, the single-token fallback did not. */
+export function assertUsableToken(token: string | undefined, label: string): asserts token is string {
+  if (!token || token.length < MIN_TOKEN_LENGTH) {
+    throw new Error(`${label} needs a token of at least ${MIN_TOKEN_LENGTH} characters`);
+  }
 }
 
 function matches(a: string, b: string): boolean {
@@ -182,7 +193,7 @@ export function scopeFor(role: Role, alias = "c"): Scope {
   const categoryMatch = `(COALESCE(${alias}.category_id, '') = ? OR LOWER(COALESCE(${alias}.category, '')) = ?)`;
   const channelMatch = `(${alias}.id = ? OR LOWER(${alias}.name) = ?)`;
 
-  if (role.allowCategories && role.allowCategories.length > 0) {
+  if (role.allowCategories) {
     clauses.push(`(${role.allowCategories.map(() => categoryMatch).join(" OR ")})`);
     for (const c of role.allowCategories) params.push(c, c.toLowerCase());
   }

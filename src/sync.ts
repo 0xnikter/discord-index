@@ -42,7 +42,7 @@ async function fetchGuild(
     onWarn: (m) => log(`! ${m}`),
   });
   const guildName = await client.guildName(config.guildId);
-  const channels = await client.listChannels(config.guildId, config.includeThreads !== "None");
+  const channels = await client.listChannels(config.guildId, config.includeThreads);
   log(`> ${channels.length} readable channels/threads, ${config.fetchConcurrency} at a time`);
 
   // Discord snowflakes embed a millisecond timestamp, so a watermark converts into a cursor without
@@ -51,19 +51,27 @@ async function fetchGuild(
 
   let done = 0;
   let unreadable = 0;
+  const truncated: string[] = [];
   await mapConcurrent(channels, config.fetchConcurrency, async (channel) => {
-    const messages = await client.fetchMessages(channel.id, afterId);
+    const result = await client.fetchMessages(channel.id, afterId);
     done++;
     if (done % 25 === 0) log(`  ${done}/${channels.length} channels`);
-    if (messages === null) {
+    if (result === null) {
       unreadable++;
       return;
     }
+    if (result.truncated) {
+      truncated.push(channel.name);
+      log(`! #${channel.name} became unreadable mid-fetch; only part of its history was retrieved`);
+    }
     // Handed over as soon as it lands: an interrupted run keeps everything already fetched.
-    onChannel({ guild: { id: config.guildId, name: guildName }, channel, messages });
+    onChannel({ guild: { id: config.guildId, name: guildName }, channel, messages: result.messages });
   });
 
   if (unreadable > 0) log(`= ${unreadable} channels not readable by this bot (permissions), skipped`);
+  if (truncated.length > 0) {
+    log(`! ${truncated.length} channel(s) only partly fetched: ${truncated.join(", ")} - run 'sync --full' once readable`);
+  }
 }
 
 function isExcluded(data: ChannelExport, exclusions: { categories: string[]; channels: string[] }): boolean {
@@ -79,6 +87,16 @@ function isExcluded(data: ChannelExport, exclusions: { categories: string[]; cha
     exclusions.channels.includes(channelId) ||
     exclusions.channels.includes(channelName)
   );
+}
+
+/** Deletes one channel's rows from a tier database. Used by both exclusion purging and re-tiering. */
+function deleteChannel(db: DB, channelId: string): number {
+  const before = (db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE channel_id = ?`).get(channelId) as { n: number }).n;
+  db.prepare(`DELETE FROM messages_fts WHERE message_id IN (SELECT id FROM messages WHERE channel_id = ?)`).run(channelId);
+  db.prepare(`DELETE FROM windows WHERE channel_id = ?`).run(channelId);
+  db.prepare(`DELETE FROM messages WHERE channel_id = ?`).run(channelId);
+  db.prepare(`DELETE FROM channels WHERE id = ?`).run(channelId);
+  return before;
 }
 
 /**
@@ -101,12 +119,7 @@ function purgeExcluded(db: DB, rules: { categories: string[]; channels: string[]
   if (doomed.length === 0) return [];
 
   const purge = db.transaction((ids: string[]) => {
-    for (const id of ids) {
-      db.prepare(`DELETE FROM messages_fts WHERE message_id IN (SELECT id FROM messages WHERE channel_id = ?)`).run(id);
-      db.prepare(`DELETE FROM windows WHERE channel_id = ?`).run(id);
-      db.prepare(`DELETE FROM messages WHERE channel_id = ?`).run(id);
-      db.prepare(`DELETE FROM channels WHERE id = ?`).run(id);
-    }
+    for (const id of ids) deleteChannel(db, id);
   });
   purge(doomed.map((c) => c.id));
   return doomed.map((c) => ({ name: c.name, messages: c.message_count }));
@@ -136,6 +149,7 @@ function upsertExport(db: DB, data: ChannelExport): number {
       content = @content, edited_ts = @edited_ts, author_name = @author_name, attachments = @attachments,
       reply_to = @reply_to
   `);
+  const existing = db.prepare(`SELECT 1 AS present FROM messages WHERE id = ?`);
   const deleteFts = db.prepare(`DELETE FROM messages_fts WHERE message_id = ?`);
   const insertFts = db.prepare(`INSERT INTO messages_fts (message_id, content, author_name) VALUES (?, ?, ?)`);
 
@@ -167,7 +181,8 @@ function upsertExport(db: DB, data: ChannelExport): number {
       attachments: JSON.stringify(m.attachments),
       reply_to: m.replyTo,
     });
-    deleteFts.run(m.id);
+    // Only pay the FTS scan when a row is actually being replaced; on a backfill this is never hit.
+    if (existing.get(m.id)) deleteFts.run(m.id);
     insertFts.run(m.id, m.content, m.authorName);
     added++;
   }
@@ -190,13 +205,27 @@ function rebuildWindows(db: DB, channelId: string): void {
 
   db.prepare(`UPDATE messages SET window_id = NULL WHERE window_id IN (SELECT id FROM windows WHERE channel_id = ? AND is_open = 1)`).run(channelId);
   db.prepare(`DELETE FROM windows WHERE channel_id = ? AND is_open = 1`).run(channelId);
+
+  // Rebuild from the oldest message that has no window, not from the newest closed window: a
+  // backfill can insert messages OLDER than an existing closed window, and anchoring on that
+  // window's end would skip them forever, wedging the orphan guard on every later run.
+  const unwindowed = db
+    .prepare(`SELECT MIN(ts) AS ts FROM messages WHERE channel_id = ? AND window_id IS NULL`)
+    .get(channelId) as { ts: number | null };
+  if (unwindowed.ts === null) return;
+
+  // Closed windows at or after that point must go too, otherwise the backfilled messages would be
+  // windowed alongside content that is already in a window.
+  db.prepare(`UPDATE messages SET window_id = NULL WHERE window_id IN (SELECT id FROM windows WHERE channel_id = ? AND end_ts >= ?)`).run(channelId, unwindowed.ts);
+  db.prepare(`DELETE FROM windows WHERE channel_id = ? AND end_ts >= ?`).run(channelId, unwindowed.ts);
+
   const boundary = db
     .prepare(`SELECT COALESCE(MAX(end_ts), 0) AS ts FROM windows WHERE channel_id = ? AND is_open = 0`)
     .get(channelId) as { ts: number };
 
   const messages = db
-    .prepare(`SELECT id, author_name, content, ts FROM messages WHERE channel_id = ? AND ts > ? ORDER BY ts ASC`)
-    .all(channelId, boundary.ts) as { id: string; author_name: string; content: string; ts: number }[];
+    .prepare(`SELECT id, author_name, content, ts FROM messages WHERE channel_id = ? AND ts >= ? AND window_id IS NULL ORDER BY ts ASC`)
+    .all(channelId, Math.min(boundary.ts, unwindowed.ts)) as { id: string; author_name: string; content: string; ts: number }[];
   if (messages.length === 0) return;
 
   const channel = db.prepare(`SELECT name FROM channels WHERE id = ?`).get(channelId) as { name: string };
@@ -241,18 +270,20 @@ function rebuildWindows(db: DB, channelId: string): void {
   // The trailing batch stays open: the next sync may extend this conversation.
   flush(true);
 
-  refreshWindowText(db, channelId);
+  refreshWindowText(db, channelId, unwindowed.ts);
 }
 
 /**
  * Re-derives each window's text from its current messages. An edited message changes its window's
  * hash, which drops the stale embedding so the next embed pass regenerates it.
  */
-function refreshWindowText(db: DB, channelId: string): void {
+function refreshWindowText(db: DB, channelId: string, since: number): void {
   const channel = db.prepare(`SELECT name FROM channels WHERE id = ?`).get(channelId) as { name: string };
+  // Windows entirely older than the oldest touched message cannot have changed, so re-hashing them
+  // every five minutes was pure work.
   const windows = db
-    .prepare(`SELECT id, text_hash FROM windows WHERE channel_id = ?`)
-    .all(channelId) as { id: number; text_hash: string }[];
+    .prepare(`SELECT id, text_hash FROM windows WHERE channel_id = ? AND end_ts >= ?`)
+    .all(channelId, since) as { id: number; text_hash: string }[];
   const members = db.prepare(`SELECT author_name, content FROM messages WHERE window_id = ? ORDER BY ts ASC`);
   const update = db.prepare(`UPDATE windows SET text = ?, text_hash = ?, embedding = NULL, embed_model = NULL WHERE id = ?`);
 
@@ -328,6 +359,13 @@ export async function reindex(): Promise<void> {
   const releaseLock = acquireLock();
   const db = openDb();
   const dbs = new Map<string, DB>([[DEFAULT_TIER, db]]);
+  // Every existing tier is opened up front. Opening them lazily during ingest meant the purge below
+  // could only ever see the default tier, and a channel that moved tiers was never cleaned out of
+  // the one it left.
+  for (const tier of loadTiers(process.env)) {
+    const path = tierDbPath(tier.name);
+    if (existsSync(path)) dbs.set(tier.name, openDb(path));
+  }
   for (const tier of loadTiers(process.env)) {
     const path = tierDbPath(tier.name);
     if (existsSync(path)) dbs.set(tier.name, openDb(path));
@@ -369,7 +407,14 @@ export async function sync(options: { full?: boolean; since?: string; seedDir?: 
   const runId = run.lastInsertRowid;
 
   try {
-    const watermark = db.prepare(`SELECT MAX(ts) AS ts FROM messages`).get() as { ts: number | null };
+    // Across every tier: a channel routed to another tier file advances only that file, so reading
+    // the default alone would skip a newly added tier's history on non-full runs.
+    let watermarkTs: number | null = null;
+    for (const handle of dbs.values()) {
+      const row = handle.prepare(`SELECT MAX(ts) AS ts FROM messages`).get() as { ts: number | null };
+      if (row.ts !== null) watermarkTs = watermarkTs === null ? row.ts : Math.max(watermarkTs, row.ts);
+    }
+    const watermark = { ts: watermarkTs };
     let sinceMs: number | null = null;
     if (options.since) {
       sinceMs = Date.parse(options.since);
@@ -384,6 +429,7 @@ export async function sync(options: { full?: boolean; since?: string; seedDir?: 
     const tiers = loadTiers(process.env);
     let added = 0;
     let channels = 0;
+    let deleted = 0;
 
     // One database per tier. A channel is written to exactly one of them, so nothing is duplicated
     // and a role simply never opens a tier it cannot read.
@@ -410,16 +456,46 @@ export async function sync(options: { full?: boolean; since?: string; seedDir?: 
     // Written channel-by-channel as each one lands, so a stall or an interrupt keeps the work
     // already done instead of discarding the entire fetch.
     const ingest = (data: ChannelExport) => {
+      // Nothing new means nothing to rebuild. Marking it touched made every sync rewrite every
+      // channel's open window and re-hash its text for no reason.
+      if (data.messages.length === 0 && !options.full) return;
       if (isExcluded(data, excludeRules)) {
         excluded.push(`#${data.channel.name}${data.channel.categoryName ? ` (${data.channel.categoryName})` : ""}`);
         return;
       }
       const tier = tierForChannel(tiers, data.channel.categoryId, data.channel.categoryName);
+
+      // A channel whose category moved it to another tier must not stay readable in the tier it
+      // left: promoting a category into a restricted tier would otherwise fail open.
+      for (const [otherTier, otherDb] of dbs) {
+        if (otherTier === tier) continue;
+        const removed = deleteChannel(otherDb, data.channel.id);
+        if (removed > 0) log(`= moved #${data.channel.name} out of tier ${otherTier} into ${tier} (${removed} messages)`);
+      }
+
       const handle = dbFor(tier);
       handle.transaction(() => {
         added += upsertExport(handle, data);
+        // Only a full run sees a channel's complete id set, so only it can tell a deleted message
+        // from one that simply predates the incremental cursor.
+        if (options.full) {
+          const ids = new Set(data.messages.map((m) => m.id));
+          const stored = handle.prepare(`SELECT id FROM messages WHERE channel_id = ?`).all(data.channel.id) as { id: string }[];
+          const gone = stored.filter((r) => !ids.has(r.id)).map((r) => r.id);
+          if (gone.length > 0) {
+            for (let i = 0; i < gone.length; i += 500) {
+              const batch = gone.slice(i, i + 500);
+              const marks = batch.map(() => "?").join(",");
+              handle.prepare(`DELETE FROM messages_fts WHERE message_id IN (${marks})`).run(...batch);
+              handle.prepare(`DELETE FROM messages WHERE id IN (${marks})`).run(...batch);
+            }
+            deleted += gone.length;
+          }
+        }
       })();
-      touchedByTier.set(tier, [...(touchedByTier.get(tier) ?? []), data.channel.id]);
+      const touched = touchedByTier.get(tier);
+      if (touched) touched.push(data.channel.id);
+      else touchedByTier.set(tier, [data.channel.id]);
       channels++;
     };
 
@@ -437,9 +513,9 @@ export async function sync(options: { full?: boolean; since?: string; seedDir?: 
     // Include every open tier, so a tier with only leftover orphans is still repaired.
     for (const tier of dbs.keys()) if (!touchedByTier.has(tier)) touchedByTier.set(tier, []);
 
-    db.transaction(() => {
-      for (const [tier, channelIds] of touchedByTier) {
-        const handle = dbFor(tier);
+    for (const [tier, channelIds] of touchedByTier) {
+      const handle = dbFor(tier);
+      handle.transaction(() => {
         // Any channel carrying messages without a window is rebuilt too, not just the ones touched
         // in this run - otherwise a run interrupted after persisting messages leaves them
         // permanently unsearchable, and the orphan check below would block every later sync.
@@ -454,8 +530,8 @@ export async function sync(options: { full?: boolean; since?: string; seedDir?: 
             message_count   = (SELECT COUNT(*) FROM messages WHERE channel_id = channels.id),
             last_message_ts = (SELECT MAX(ts)  FROM messages WHERE channel_id = channels.id)
         `);
-      }
-    })();
+      })();
+    }
 
     for (const [tier, handle] of dbs) {
       const orphaned = handle.prepare(`SELECT COUNT(*) AS n FROM messages WHERE window_id IS NULL`).get() as { n: number };
@@ -475,7 +551,7 @@ export async function sync(options: { full?: boolean; since?: string; seedDir?: 
       `UPDATE sync_runs SET finished_at = ?, channels_synced = ?, messages_added = ?, windows_embedded = ?, error = ? WHERE id = ?`,
     ).run(Date.now(), channels, added, embedded, failure, runId);
 
-    log(`= synced ${channels} channels, ${added} messages, ${embedded} windows embedded`);
+    log(`= synced ${channels} channels, ${added} messages${deleted > 0 ? `, ${deleted} deleted` : ""}, ${embedded} windows embedded`);
     log(`= tiers: ${[...dbs.keys()].join(", ")}`);
     if (excluded.length > 0) log(`= excluded from the index: ${excluded.join(", ")}`);
   } catch (error) {

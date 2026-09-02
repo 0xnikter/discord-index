@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Deploy discord-index to a remote Linux host over SSH: rsync the project, fetch the linux DCE
-# build, install user systemd units for the sync timer and the loopback MCP server.
+# Deploy discord-index to a remote Linux host over SSH: rsync the project, build it, and install
+# user systemd units for the sync timer and the loopback MCP server.
 #
 #   bash scripts/install-remote.sh <ssh-host>
 set -euo pipefail
@@ -20,7 +20,6 @@ cd "${REMOTE_DIR}"
 corepack enable >/dev/null 2>&1 || true
 pnpm install --prod=false
 pnpm build
-bash scripts/fetch-dce.sh
 
 mkdir -p ~/.config/systemd/user
 cp deploy/discord-index-sync.service  ~/.config/systemd/user/

@@ -63,7 +63,11 @@ export async function embedQuery(query: string): Promise<Float32Array> {
 }
 
 export function dot(a: Float32Array, b: Float32Array): number {
-  if (a.length !== b.length) return -1;
+  // A dimension mismatch is a data-integrity failure, not a low score: returning -1 would let a
+  // corrupt vector rank normally.
+  if (a.length !== b.length) {
+    throw new Error(`Embedding dimension mismatch: query ${a.length} vs stored ${b.length}. Re-run sync after an EMBED_MODEL change.`);
+  }
   let sum = 0;
   for (let i = 0; i < a.length; i++) sum += a[i] * b[i];
   return sum;

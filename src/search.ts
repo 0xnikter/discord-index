@@ -1,7 +1,8 @@
 import { config, embeddingsEnabled } from "./config.js";
 import { type DB, blobToFloats } from "./db.js";
 import { dot, embedQuery } from "./embed.js";
-import { FULL_SCOPE, type Scope } from "./roles.js";
+import { THREAD_TYPES } from "./discord.js";
+import { DEFAULT_TIER, FULL_SCOPE, type Scope } from "./roles.js";
 
 /** An open tier database. Window ids repeat across tiers, so every id is namespaced by tier. */
 export interface TierDb {
@@ -31,6 +32,14 @@ export interface SearchHit {
   messages: { ts: string; author: string; content: string; jump_url: string; matched: boolean }[];
 }
 
+interface Row {
+  id: string;
+  ts: number;
+  author_name: string;
+  content: string;
+  jump_url: string;
+}
+
 export interface SearchResult {
   hits: SearchHit[];
   freshness: { last_sync: string | null; minutes_behind: number | null; stale: boolean; warning?: string };
@@ -43,10 +52,6 @@ export interface SearchResult {
 }
 
 const RRF_K = 60;
-/**
- * How far to reach when assembling the conversation around a hit. Applied at RETRIEVAL time, not
- * indexing, so it can be generous without blurring any embedding.
- */
 /**
  * How far to reach when assembling a conversation. A lookup for an error string wants a tight
  * result; "what did we decide about X" wants the discussion. One fixed reach is wrong for both.
@@ -65,7 +70,8 @@ const CANDIDATES = 120;
 const FTS_CANDIDATE_MESSAGES = 2000;
 
 function toMs(value: string | undefined): number | null {
-  if (!value) return null;
+  if (value === undefined) return null;
+  if (value.trim() === "") throw new Error("Date filters must not be empty");
   const parsed = Date.parse(value);
   if (Number.isNaN(parsed)) throw new Error(`Invalid date: "${value}" (expected ISO, e.g. 2026-08-01)`);
   return parsed;
@@ -76,6 +82,11 @@ function sanitizeFtsQuery(query: string): string {
   const terms = query.match(/[\p{L}\p{N}_]+/gu) ?? [];
   if (terms.length === 0) throw new Error(`Query "${query}" has no searchable terms`);
   return terms.map((t) => `"${t}"`).join(" OR ");
+}
+
+/** `%` and `_` in a name would otherwise act as wildcards and match the wrong authors. */
+function escapeLike(value: string): string {
+  return value.replace(/[\\%_]/g, (c) => `\\${c}`);
 }
 
 function freshness(db: DB) {
@@ -100,56 +111,92 @@ function keywordRanking(db: DB, query: string, filters: SearchFilters, limit: nu
   const params: unknown[] = [sanitizeFtsQuery(query), ...scope.params];
 
   if (filters.channel) { clauses.push("c.name = ?"); params.push(filters.channel); }
-  if (filters.author) { clauses.push("m.author_name LIKE ?"); params.push(`%${filters.author}%`); }
+  if (filters.author) { clauses.push("m.author_name LIKE ? ESCAPE '\\'"); params.push(`%${escapeLike(filters.author)}%`); }
   const after = toMs(filters.after);
   if (after !== null) { clauses.push("m.ts >= ?"); params.push(after); }
   const before = toMs(filters.before);
   if (before !== null) { clauses.push("m.ts <= ?"); params.push(before); }
 
-  // bm25() is an FTS5 auxiliary function: it is only legal in a direct query of the FTS table,
-  // so scoring happens in the CTE and the joins/filters/aggregation happen outside it.
+  // bm25() is only legal in a direct query of the FTS table, so scoring stays in the CTE - but every
+  // filter is pushed in as a message_id constraint. A LIMIT applied before filtering silently
+  // returns nothing whenever the term is common enough to fill the cap from other channels.
   const matchParam = params.shift();
   const rows = db
     .prepare(`
-      WITH hits AS (
+      WITH eligible AS (
+        SELECT m.id FROM messages m JOIN channels c ON c.id = m.channel_id
+        WHERE ${clauses.join(" AND ")}
+      ),
+      hits AS (
         SELECT message_id, bm25(messages_fts) AS score
         FROM messages_fts
-        WHERE messages_fts MATCH ?
+        WHERE messages_fts MATCH ? AND message_id IN (SELECT id FROM eligible)
         ORDER BY score ASC
         LIMIT ${FTS_CANDIDATE_MESSAGES}
       )
       SELECT m.window_id AS window_id, MIN(hits.score) AS score
       FROM hits
       JOIN messages m ON m.id = hits.message_id
-      JOIN channels c ON c.id = m.channel_id
-      ${clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : ""}
       GROUP BY m.window_id
       ORDER BY score ASC
       LIMIT ?
     `)
-    .all(matchParam, ...params, limit) as { window_id: number }[];
+    .all(...params, matchParam, limit) as { window_id: number }[];
   return rows.map((r) => r.window_id);
 }
 
+interface VectorCache {
+  version: number;
+  rows: { id: number; vec: Float32Array }[];
+}
+const vectorCache = new Map<DB, VectorCache>();
+
+/**
+ * Window vectors for one database, cached until the window table changes. The cache key is the
+ * embedded-window count plus the newest window id, which is enough to notice a sync.
+ */
+function embeddedVectors(db: DB): { id: number; vec: Float32Array }[] {
+  const stamp = db
+    .prepare(`SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS top FROM windows WHERE embedding IS NOT NULL AND embed_model = ?`)
+    .get(config.embedModel) as { n: number; top: number };
+  const version = stamp.n * 1_000_003 + stamp.top;
+
+  const cached = vectorCache.get(db);
+  if (cached && cached.version === version) return cached.rows;
+
+  const rows = (
+    db
+      .prepare(`SELECT id, embedding FROM windows WHERE embedding IS NOT NULL AND embed_model = ?`)
+      .all(config.embedModel) as { id: number; embedding: Buffer }[]
+  ).map((r) => ({ id: r.id, vec: blobToFloats(r.embedding) }));
+  vectorCache.set(db, { version, rows });
+  return rows;
+}
+
 function semanticRanking(db: DB, queryVec: Float32Array, filters: SearchFilters, limit: number, scope: Scope): number[] {
-  const clauses: string[] = ["w.embedding IS NOT NULL", `(${scope.sql})`];
-  const params: unknown[] = [...scope.params];
+  // Vectors from a previous EMBED_MODEL are not comparable with the current query vector, and a
+  // same-dimension model swap is undetectable at score time, so filter them out here.
+  const clauses: string[] = ["w.embedding IS NOT NULL", "w.embed_model = ?", `(${scope.sql})`];
+  const params: unknown[] = [config.embedModel, ...scope.params];
   if (filters.channel) { clauses.push("c.name = ?"); params.push(filters.channel); }
   const after = toMs(filters.after);
   if (after !== null) { clauses.push("w.end_ts >= ?"); params.push(after); }
   const before = toMs(filters.before);
   if (before !== null) { clauses.push("w.start_ts <= ?"); params.push(before); }
   if (filters.author) {
-    clauses.push("EXISTS (SELECT 1 FROM messages m WHERE m.window_id = w.id AND m.author_name LIKE ?)");
-    params.push(`%${filters.author}%`);
+    clauses.push("EXISTS (SELECT 1 FROM messages m WHERE m.window_id = w.id AND m.author_name LIKE ? ESCAPE '\\')");
+    params.push(`%${escapeLike(filters.author)}%`);
   }
 
-  const rows = db
-    .prepare(`SELECT w.id, w.embedding FROM windows w JOIN channels c ON c.id = w.channel_id WHERE ${clauses.join(" AND ")}`)
-    .all(...params) as { id: number; embedding: Buffer }[];
+  // Which windows the caller may see; the vectors themselves come from the process-wide cache.
+  const allowed = new Set(
+    (db.prepare(`SELECT w.id FROM windows w JOIN channels c ON c.id = w.channel_id WHERE ${clauses.join(" AND ")}`)
+      .all(...params) as { id: number }[]).map((r) => r.id),
+  );
 
-  return rows
-    .map((r) => ({ id: r.id, score: dot(queryVec, blobToFloats(r.embedding)) }))
+  return embeddedVectors(db)
+    .filter((r) => allowed.has(r.id))
+    .map((r) => ({ id: r.id, score: dot(queryVec, r.vec) }))
     .sort((a, b) => b.score - a.score)
     .slice(0, limit)
     .map((r) => r.id);
@@ -178,7 +225,7 @@ export async function search(
   options: { mode?: SearchMode; limit?: number; scope?: Scope; context?: ContextLevel } = {},
 ): Promise<SearchResult> {
   // A bare handle is treated as the single default tier, so callers that do not use tiers are unchanged.
-  const tiers: TierDb[] = Array.isArray(target) ? target : [{ tier: "common", db: target }];
+  const tiers: TierDb[] = Array.isArray(target) ? target : [{ tier: DEFAULT_TIER, db: target }];
   if (tiers.length === 0) throw new Error("no readable tiers for this role");
   const db = tiers[0].db;
   const limit = Math.min(Math.max(options.limit ?? 10, 1), 50);
@@ -230,10 +277,17 @@ export async function search(
   };
 
   const groups: { key: string; tier: string; ids: number[]; score: number; matched_by: string[]; from: number; to: number }[] = [];
-  for (const entry of fusedAll) {
-    const tier = entry.id.slice(0, entry.id.indexOf(":"));
+  // Merge in time order so grouping is deterministic; score order made it depend on ranking.
+  const byTime = fusedAll
+    .map((entry) => {
+      const tier = entry.id.slice(0, entry.id.indexOf(":"));
+      return { entry, tier, rawId: Number(entry.id.slice(entry.id.indexOf(":") + 1)) };
+    })
+    .map((e) => ({ ...e, meta: windowMeta(e.tier, e.rawId) }))
+    .sort((a, b) => (a.tier === b.tier ? (a.meta.channel_id === b.meta.channel_id ? a.meta.start_ts - b.meta.start_ts : a.meta.channel_id.localeCompare(b.meta.channel_id)) : a.tier.localeCompare(b.tier)));
+
+  for (const { entry, tier, meta } of byTime) {
     const rawId = Number(entry.id.slice(entry.id.indexOf(":") + 1));
-    const meta = windowMeta(tier, rawId);
     const existing = groups.find(
       (g) =>
         g.tier === tier &&
@@ -243,7 +297,8 @@ export async function search(
     );
     if (existing) {
       existing.ids.push(rawId);
-      existing.score += entry.score;
+      // Max, not sum: five mediocre windows in one channel should not outrank the best single hit.
+      existing.score = Math.max(existing.score, entry.score);
       existing.matched_by = [...new Set([...existing.matched_by, ...entry.matched_by])];
       existing.from = Math.min(existing.from, meta.start_ts);
       existing.to = Math.max(existing.to, meta.end_ts);
@@ -262,41 +317,66 @@ export async function search(
    *      without hitting reply, so structure is absent for the majority of content
    */
   const conversationFor = (handle: DB, channelId: string, isThread: boolean, ids: string[], from: number, to: number) => {
-    const chain = new Set(ids);
-    const replyUp = handle.prepare(`SELECT reply_to FROM messages WHERE id = ? AND reply_to IS NOT NULL`);
-    const replyDown = handle.prepare(`SELECT id FROM messages WHERE reply_to = ?`);
+    const scopeJoin = `JOIN channels c ON c.id = m.channel_id`;
+    const half = Math.max(1, Math.floor(reach.maxMessages / 2));
 
-    // Walk both directions; bounded so a long chain cannot return an entire channel.
-    for (let depth = 0; depth < 10 && chain.size < reach.maxMessages; depth++) {
+    // Every statement here is scoped. The reply walk in particular can cross channels, because a
+    // Discord forward or crosspost stores a reply_to pointing at another channel - so without the
+    // predicate a hit in an allowed channel can drag denied content in behind it.
+    const replyUp = handle.prepare(
+      `SELECT m.reply_to AS id FROM messages m ${scopeJoin} WHERE m.id = ? AND m.reply_to IS NOT NULL AND (${scope.sql})`,
+    );
+    const replyDown = handle.prepare(`SELECT m.id FROM messages m ${scopeJoin} WHERE m.reply_to = ? AND (${scope.sql})`);
+
+    const chain = new Set(ids);
+    outer: for (let depth = 0; depth < 10; depth++) {
       let grew = false;
       for (const id of [...chain]) {
-        const up = replyUp.get(id) as { reply_to: string } | undefined;
-        if (up && !chain.has(up.reply_to)) { chain.add(up.reply_to); grew = true; }
-        for (const down of replyDown.all(id) as { id: string }[]) {
-          if (!chain.has(down.id)) { chain.add(down.id); grew = true; }
+        const up = replyUp.get(id, ...scope.params) as { id: string } | undefined;
+        if (up && !chain.has(up.id)) {
+          chain.add(up.id);
+          grew = true;
+          if (chain.size >= reach.maxMessages) break outer;
+        }
+        for (const down of replyDown.all(id, ...scope.params) as { id: string }[]) {
+          if (chain.has(down.id)) continue;
+          chain.add(down.id);
+          grew = true;
+          // Checked inside the loop: one popular message can have hundreds of replies, and a
+          // between-passes check would let them all in at once.
+          if (chain.size >= reach.maxMessages) break outer;
         }
       }
       if (!grew) break;
     }
 
-    // A thread is small and self-contained, so return all of it; otherwise reach out in time.
-    const sql = isThread
-      ? `SELECT id, ts, author_name, content, jump_url FROM messages WHERE channel_id = ? ORDER BY ts ASC LIMIT ?`
-      : `SELECT id, ts, author_name, content, jump_url FROM messages
-         WHERE channel_id = ? AND ts BETWEEN ? AND ? ORDER BY ts ASC LIMIT ?`;
-    const rows = (isThread
-      ? handle.prepare(sql).all(channelId, reach.maxMessages)
-      : handle.prepare(sql).all(channelId, from - reach.windowMs, to + reach.windowMs, reach.maxMessages)
-    ) as { id: string; ts: number; author_name: string; content: string; jump_url: string }[];
+    // Centre the context on the match. Taking the earliest N of a span that starts before the hit
+    // spends the whole budget on preceding context and truncates the matched messages themselves.
+    const before = handle
+      .prepare(
+        `SELECT m.id, m.ts, m.author_name, m.content, m.jump_url FROM messages m ${scopeJoin}
+         WHERE m.channel_id = ? AND m.ts < ? ${isThread ? "" : "AND m.ts >= ?"} AND (${scope.sql})
+         ORDER BY m.ts DESC LIMIT ?`,
+      )
+      .all(...(isThread ? [channelId, from] : [channelId, from, from - reach.windowMs]), ...scope.params, half) as Row[];
+    const after = handle
+      .prepare(
+        `SELECT m.id, m.ts, m.author_name, m.content, m.jump_url FROM messages m ${scopeJoin}
+         WHERE m.channel_id = ? AND m.ts >= ? ${isThread ? "" : "AND m.ts <= ?"} AND (${scope.sql})
+         ORDER BY m.ts ASC LIMIT ?`,
+      )
+      .all(...(isThread ? [channelId, from] : [channelId, from, to + reach.windowMs]), ...scope.params, reach.maxMessages - half) as Row[];
 
-    const extra = chain.size > ids.length
-      ? (handle
-          .prepare(`SELECT id, ts, author_name, content, jump_url FROM messages WHERE id IN (${[...chain].map(() => "?").join(",")})`)
-          .all(...chain) as typeof rows)
-      : [];
+    // The matched messages are unioned back in unconditionally, so no LIMIT can drop them.
+    const core = handle
+      .prepare(
+        `SELECT m.id, m.ts, m.author_name, m.content, m.jump_url FROM messages m ${scopeJoin}
+         WHERE m.id IN (${[...chain].map(() => "?").join(",")}) AND (${scope.sql})`,
+      )
+      .all(...chain, ...scope.params) as Row[];
 
-    const merged = new Map(rows.map((r) => [r.id, r]));
-    for (const r of extra) merged.set(r.id, r);
+    const merged = new Map<string, Row>();
+    for (const r of [...before, ...after, ...core]) merged.set(r.id, r);
     return [...merged.values()].sort((a, b) => a.ts - b.ts);
   };
 
@@ -313,18 +393,18 @@ export async function search(
       | undefined;
     const matched = new Set(core.map((m) => m.id));
     const messages = channel
-      ? conversationFor(handle, channel.id, channel.type === "11" || channel.type === "12", core.map((m) => m.id), from, to)
+      ? conversationFor(handle, channel.id, THREAD_TYPES.has(channel.type), core.map((m) => m.id), from, to)
       : core;
     return {
       tier,
       window_id: w.id,
       channel: w.channel,
       category: w.category,
-      start: new Date(messages[0]?.ts ?? from).toISOString(),
-      end: new Date(messages[messages.length - 1]?.ts ?? to).toISOString(),
+      start: new Date(from).toISOString(),
+      end: new Date(to).toISOString(),
       score: Number(score.toFixed(5)),
       matched_by,
-      jump_url: messages[0]?.jump_url ?? "",
+      jump_url: core[0]?.jump_url ?? messages[0]?.jump_url ?? "",
       messages: messages.map((m) => ({
         ts: new Date(m.ts).toISOString(),
         author: m.author_name,
@@ -340,7 +420,7 @@ export async function search(
 }
 
 export function getContext(target: DB | TierDb[], messageId: string, before = 15, after = 15, scope: Scope = FULL_SCOPE) {
-  const tiers: TierDb[] = Array.isArray(target) ? target : [{ tier: "common", db: target }];
+  const tiers: TierDb[] = Array.isArray(target) ? target : [{ tier: DEFAULT_TIER, db: target }];
   // The message lives in exactly one tier; tiers this role cannot read were never opened.
   for (const { db: handle } of tiers) {
     const found = getContextIn(handle, messageId, before, after, scope);
@@ -380,7 +460,7 @@ function getContextIn(db: DB, messageId: string, before: number, after: number, 
 }
 
 export function listChannels(target: DB | TierDb[], scope: Scope = FULL_SCOPE): unknown[] {
-  const tiers: TierDb[] = Array.isArray(target) ? target : [{ tier: "common", db: target }];
+  const tiers: TierDb[] = Array.isArray(target) ? target : [{ tier: DEFAULT_TIER, db: target }];
   return tiers.flatMap(({ tier, db }) => listChannelsIn(db, scope).map((c) => ({ ...c, tier })));
 }
 
@@ -401,7 +481,7 @@ function listChannelsIn(db: DB, scope: Scope) {
 }
 
 export function syncStatus(target: DB | TierDb[], scope: Scope = FULL_SCOPE): Record<string, unknown> {
-  const tiers: TierDb[] = Array.isArray(target) ? target : [{ tier: "common", db: target }];
+  const tiers: TierDb[] = Array.isArray(target) ? target : [{ tier: DEFAULT_TIER, db: target }];
   const per = tiers.map(({ tier, db }) => ({ tier, ...syncStatusIn(db, scope) }));
   return {
     messages: per.reduce((n, t) => n + t.messages, 0),
@@ -449,14 +529,19 @@ function syncStatusIn(db: DB, scope: Scope = FULL_SCOPE): TierStatus {
     ...totals,
     embeddings_enabled: embeddingsEnabled(),
     freshness: freshness(db),
+    // Volume counters describe the whole corpus, so a scoped caller only gets timing and errors.
     last_run: lastRun
       ? {
           started: new Date(lastRun.started_at).toISOString(),
           finished: lastRun.finished_at ? new Date(lastRun.finished_at).toISOString() : null,
-          channels: lastRun.channels_synced,
-          messages_added: lastRun.messages_added,
-          windows_embedded: lastRun.windows_embedded,
           error: lastRun.error,
+          ...(scope.sql === "1=1"
+            ? {
+                channels: lastRun.channels_synced,
+                messages_added: lastRun.messages_added,
+                windows_embedded: lastRun.windows_embedded,
+              }
+            : {}),
         }
       : null,
   };
