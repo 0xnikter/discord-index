@@ -2,6 +2,8 @@
 
 **Search your team's whole Discord from inside Claude, in about a second.**
 
+![Asking Claude why production went down, answered from three years of indexed Discord](docs/demo.gif)
+
 ```
 you:  what did we decide about switching the queue backend?
 
