@@ -1,0 +1,7 @@
+node_modules/
+dist/
+data/
+export/
+vendor/
+.env
+*.log

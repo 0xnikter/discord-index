@@ -1,0 +1,7 @@
+# Default policy: no exclusions, no roles.
+#
+# With no `roles:` block the server uses the single MCP_AUTH_TOKEN as one full-access role.
+# See policy.example.yaml for tiers, per-role tokens and exclude rules.
+exclude:
+  categories: []
+  channels: []

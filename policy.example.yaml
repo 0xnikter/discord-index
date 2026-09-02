@@ -1,0 +1,64 @@
+# discord-index access policy.
+#
+# NO SECRETS IN THIS FILE — tokens are referenced by environment variable name, so this belongs in
+# version control where changes to who-can-see-what get reviewed like any other change.
+#
+# Point POLICY_FILE at a copy of this.
+
+# ---------------------------------------------------------------------------
+# Never indexed. The content never enters the database, so no role, no future
+# misconfiguration, and nobody reading the file can reach it. Strongest guarantee —
+# use it for anything that must not be stored at all.
+# Entries are matched against the Discord category/channel ID *and* the lowercased name.
+# PREFER IDS: a category renamed in Discord would silently stop matching a name rule, quietly
+# widening access. Enable Developer Mode in Discord, then right-click a category -> Copy ID.
+# ---------------------------------------------------------------------------
+exclude:
+  categories: []
+  channels: []
+
+# ---------------------------------------------------------------------------
+# Tiers. Each tier is stored in its OWN database file (data/index.<tier>.db).
+# A channel lives in exactly one tier, so nothing is duplicated and no embedding
+# is paid for twice. Anything not claimed by a tier goes to the implicit
+# "common" tier (data/index.db).
+#
+# This is the strong isolation boundary: a role that cannot read a tier never
+# opens that file, so a forgotten filter in some future query cannot leak it.
+# ---------------------------------------------------------------------------
+tiers:
+  - name: cofounder
+    categories:
+      - "000000000000000000"   # Co-Founder category id
+
+# ---------------------------------------------------------------------------
+# Roles. Each token maps to exactly one role; the role decides which channels its
+# holder can read. Scoping is enforced in SQL on every tool, so a denied channel is
+# invisible to search, list_channels, sync_status counts, and get_context alike.
+#
+#   tokenEnv        env var holding the token (generate: openssl rand -hex 32)
+#   denyCategories  categories this role may NOT read
+#   allowCategories if set, the ONLY categories this role may read (deny still applies)
+#
+# A role whose tokenEnv is unset aborts startup rather than silently denying or,
+# worse, silently allowing.
+# ---------------------------------------------------------------------------
+roles:
+  # Reads only the common tier; the cofounder database is never opened.
+  - name: team
+    tokenEnv: MCP_TOKEN_TEAM
+    tiers: [common]
+
+  # Same tier, narrowed further by category within it.
+  - name: marketing
+    tokenEnv: MCP_TOKEN_MARKETING
+    tiers: [common]
+    allowCategories:
+      - Growth
+      - Product
+
+  # Searches across both tiers in one call; results are fused, so this is a single
+  # MCP endpoint and a single search, not two.
+  - name: cofounder
+    tokenEnv: MCP_TOKEN_COFOUNDER
+    tiers: [common, cofounder]

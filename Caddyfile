@@ -1,0 +1,7 @@
+# SITE_ADDRESS is either a hostname (Caddy gets a Let's Encrypt cert automatically) or ":80"
+# (plain HTTP, for when TLS is terminated upstream by Cloudflare, a load balancer, or a tunnel).
+{$SITE_ADDRESS} {
+	encode gzip
+	# The MCP server does its own bearer check; Caddy only terminates TLS and proxies.
+	reverse_proxy discord-index:8087
+}

@@ -1,0 +1,12 @@
+[Unit]
+Description=discord-index sync (DiscordChatExporter -> SQLite FTS5 + embeddings)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/discord-index
+ExecStart=/usr/bin/env node dist/cli.js sync
+# Sync failures must be visible in journalctl, not retried into silence.
+StandardOutput=journal
+StandardError=journal

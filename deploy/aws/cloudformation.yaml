@@ -1,0 +1,353 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  discord-index - a searchable Discord index served over MCP. Provisions one EC2 instance with a
+  persistent EBS root volume, an Elastic IP, and Caddy for automatic HTTPS. Point your domain's A
+  record at the Elastic IP shown in Outputs.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: "Networking"}
+        Parameters: [VpcId, SubnetId, Domain, AllowedSshCidr]
+      - Label: {default: "Discord"}
+        Parameters: [DiscordToken, DiscordGuildId, IncludeThreads]
+      - Label: {default: "MCP access"}
+        Parameters: [McpAuthToken]
+      - Label: {default: "Embeddings (optional)"}
+        Parameters: [OpenAiApiKey]
+      - Label: {default: "Instance"}
+        Parameters: [InstanceType, VolumeSizeGb, RepoUrl]
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to launch into.
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >
+      A PUBLIC subnet - one whose route table has a route to an internet gateway. The instance is given
+      a public IP at launch (it needs internet during boot); the Elastic IP replaces it afterwards.
+  Domain:
+    Type: String
+    Default: ""
+    Description: >
+      Hostname for automatic HTTPS, e.g. discord-mcp.example.com. Point its A record at the Elastic IP
+      after the stack completes. Leave EMPTY when TLS is terminated upstream (Cloudflare proxy, ALB,
+      tunnel) or for a locked-down test - the server then listens on plain HTTP port 80.
+  ExistingElasticIp:
+    Type: String
+    Default: ""
+    Description: >
+      Allocation id (eipalloc-...) of an Elastic IP you allocated yourself. STRONGLY RECOMMENDED once
+      DNS points at this stack: an EIP created by the stack is released when the stack is replaced,
+      which silently breaks the DNS record. Leave empty to have the stack allocate one.
+  AllowedMcpCidr:
+    Type: String
+    AllowedPattern: "^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$"
+    Description: >
+      REQUIRED. CIDR allowed to reach the MCP endpoint - your office or VPN range, e.g. 203.0.113.4/32.
+      Use 0.0.0.0/0 only when a CDN or tunnel fronts this host. There is deliberately no default.
+  AllowedSshCidr:
+    Type: String
+    Default: "127.0.0.1/32"
+    Description: CIDR allowed to SSH. Leave as the default to disable SSH entirely (use SSM Session Manager).
+  DiscordToken:
+    Type: String
+    NoEcho: true
+    Description: Discord bot token. Bot needs View Channels + Read Message History and the Message Content intent.
+  DiscordGuildId:
+    Type: String
+    Description: Discord server (guild) id.
+  RoleTokensJson:
+    Type: String
+    NoEcho: true
+    Default: "{}"
+    Description: >
+      JSON object of the token env vars your policy.yaml references, e.g.
+      {"MCP_TOKEN_TEAM":"...","MCP_TOKEN_COFOUNDER":"..."}. Stored in Secrets Manager alongside the
+      other credentials, never in user-data. Leave as {} when using a single MCP_AUTH_TOKEN.
+  PolicyYaml:
+    Type: String
+    Default: ""
+    Description: >
+      Contents of policy.yaml (tiers, roles, exclude rules), inlined. Leave empty for a single
+      full-access token with no tiers. Role tokens are referenced by env var name, so this holds no secrets.
+  SyncIntervalSeconds:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    Description: >
+      Seconds between sync runs, measured from the END of the previous run, so runs never overlap.
+      All channels share one Discord bucket (5 req/s), making a full incremental pass ~90s - values
+      below ~180 leave little idle time.
+  IncludeThreads:
+    Type: String
+    Default: Active
+    AllowedValues: [None, Active, All]
+    Description: "All re-walks every archived thread on every sync; Active is the sane recurring default."
+  McpAuthToken:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: Bearer token clients must present. Generate with `openssl rand -hex 32`.
+  OpenAiApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: Optional. Enables semantic search; without it the index is keyword-only.
+  InstanceType:
+    Type: String
+    Default: t4g.small
+    AllowedValues: [t4g.small, t4g.medium, t4g.large]
+    Description: Graviton (arm64) instance type.
+  VolumeSizeGb:
+    Type: Number
+    Default: 20
+    MinValue: 8
+    Description: Root volume size. The index and exports live here; both are rebuildable by re-syncing.
+  SourceUrl:
+    Type: String
+    Description: >
+      Where the instance fetches the code: either a git URL (https://github.com/you/discord-index.git)
+      or an S3 URI to a tarball (s3://bucket/discord-index.tgz) for a private deployment.
+  SourceBucket:
+    Type: String
+    Default: ""
+    Description: Bucket name to grant read on. Required only when SourceUrl is an s3:// URI.
+
+Conditions:
+  SshEnabled: !Not [!Equals [!Ref AllowedSshCidr, "127.0.0.1/32"]]
+  HasDomain: !Not [!Equals [!Ref Domain, ""]]
+  CreateEip: !Equals [!Ref ExistingElasticIp, ""]
+  FromS3: !Not [!Equals [!Ref SourceBucket, ""]]
+
+Resources:
+  Secrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/config"
+      Description: Discord/MCP/OpenAI credentials, fetched at boot by the instance role.
+      SecretString: !Sub
+        - '{"DISCORD_TOKEN":"${DiscordToken}","MCP_AUTH_TOKEN":"${McpAuthToken}","OPENAI_API_KEY":"${OpenAiApiKey}","_roles":${Roles}}'
+        - Roles: !Ref RoleTokensJson
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: discord-index - HTTPS in, everything else closed
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # With a domain: 80 carries the ACME challenge and redirects to 443.
+        # Without one: 80 IS the endpoint, so it must be reachable by clients.
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !If [HasDomain, "0.0.0.0/0", !Ref AllowedMcpCidr]
+          Description: !If [HasDomain, ACME challenge, MCP over HTTP]
+        - !If
+          - HasDomain
+          - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: !Ref AllowedMcpCidr, Description: MCP over HTTPS}
+          - !Ref AWS::NoValue
+      Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-sg"}]
+
+  SshIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: SshEnabled
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Ref AllowedSshCidr
+      Description: SSH
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: sts:AssumeRole}
+      # Session Manager gives a shell without opening port 22.
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - !If
+          - FromS3
+          - PolicyName: ReadSourceBundle
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: [s3:GetObject]
+                  Resource: !Sub "arn:${AWS::Partition}:s3:::${SourceBucket}/*"
+          - !Ref AWS::NoValue
+        - PolicyName: ReadOwnSecrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref Secrets
+        - PolicyName: SignalOwnStack
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: cloudformation:SignalResource
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Sub "{{resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id}}"
+      IamInstanceProfile: !Ref InstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          SubnetId: !Ref SubnetId
+          GroupSet: [!Ref SecurityGroup]
+          AssociatePublicIpAddress: true
+          DeleteOnTermination: true
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+        HttpEndpoint: enabled
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs: {VolumeSize: !Ref VolumeSizeGb, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true}
+      Tags: [{Key: Name, Value: !Ref AWS::StackName}]
+      UserData:
+        Fn::Base64:
+          Fn::Sub:
+            - |
+              #!/bin/bash
+              set -euxo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+
+              apt-get update
+              apt-get install -y ca-certificates curl git unzip unattended-upgrades fail2ban
+
+              # Security patches apply themselves; an unpatched long-lived box is the likelier
+              # compromise here than anything reaching the MCP endpoint.
+              cat > /etc/apt/apt.conf.d/20auto-upgrades <<'AUTOEOF'
+              APT::Periodic::Update-Package-Lists "1";
+              APT::Periodic::Unattended-Upgrade "1";
+              AUTOEOF
+
+              # Guards sshd, which only has an ingress rule when AllowedSshCidr is set. Harmless
+              # otherwise; the MCP endpoint is rate-limited in the application, not here.
+              systemctl enable --now fail2ban
+
+              # Ubuntu 24.04 has no 'awscli' apt candidate, and the signal below needs the CLI, so
+              # install v2 from the official bundle before anything can fail into the trap.
+              ARCH="$(uname -m)"
+              curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${!ARCH}.zip" -o /tmp/awscliv2.zip
+              unzip -q /tmp/awscliv2.zip -d /tmp
+              /tmp/aws/install
+              hash -r
+              aws --version
+
+              # Only now can a failure be reported: signal FAILURE so a broken boot rolls the stack
+              # back with a reason instead of hanging until the CreationPolicy times out.
+              signal() { aws cloudformation signal-resource \
+                --stack-name ${AWS::StackName} --logical-resource-id Instance \
+                --unique-id "$(cat /var/lib/cloud/data/instance-id)" --status "$1" \
+                --region ${AWS::Region} || true; }
+              trap 'signal FAILURE' ERR
+              install -m 0755 -d /etc/apt/keyrings
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+              chmod a+r /etc/apt/keyrings/docker.asc
+              echo "deb [arch=arm64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable" \
+                > /etc/apt/sources.list.d/docker.list
+              apt-get update
+              apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+              mkdir -p /opt/discord-index
+              case "${SourceUrl}" in
+                s3://*) aws s3 cp "${SourceUrl}" /tmp/src.tgz
+                        tar -xzf /tmp/src.tgz -C /opt/discord-index --strip-components=1
+                        rm -f /tmp/src.tgz ;;
+                *)      git clone --depth 1 "${SourceUrl}" /opt/discord-index ;;
+              esac
+              cd /opt/discord-index
+
+              # Secrets land in a root-only file, never in the image or the compose file.
+              umask 077
+              # Access policy travels with the stack: it lives outside the public repo, so cloning
+              # the source alone would silently index channels the policy excludes.
+              cat > policy.yaml <<'POLICYEOF'
+              ${PolicyYaml}
+              POLICYEOF
+
+              cat > .env <<ENVEOF
+              POLICY_FILE=/app/policy.yaml
+              DISCORD_GUILD_ID=${DiscordGuildId}
+              INCLUDE_THREADS=${IncludeThreads}
+              SYNC_INTERVAL_SECONDS=${SyncIntervalSeconds}
+              DISCORD_REQUESTS_PER_SECOND=4
+              SYNC_OVERLAP_MINUTES=10
+              SITE_ADDRESS=${SiteAddr}
+              HTTP_HOST=0.0.0.0
+              ENVEOF
+              # Credentials are fetched, never written into user-data, so they are not exposed
+              # through the instance metadata endpoint.
+              aws secretsmanager get-secret-value --secret-id ${Secrets} --region ${AWS::Region} \
+                --query SecretString --output text \
+                | python3 -c 'import json,sys; d=json.load(sys.stdin); r=d.pop("_roles",{}); [print(f"{k}={v}") for k,v in {**d, **r}.items()]' \
+                >> .env
+              chmod 600 .env
+
+              docker compose up -d --build
+
+              # Only report success once the server actually answers.
+              for _ in $(seq 1 60); do
+                if curl -fsS http://127.0.0.1/healthz >/dev/null 2>&1; then break; fi
+                sleep 5
+              done
+              curl -fsS http://127.0.0.1/healthz >/dev/null
+              trap - ERR
+              signal SUCCESS
+            - SiteAddr: !If [HasDomain, !Ref Domain, ":80"]
+    CreationPolicy:
+      ResourceSignal: {Timeout: PT20M, Count: 1}
+
+  # Retained on delete so the address - and therefore the DNS record - survives a stack replacement.
+  ElasticIp:
+    Type: AWS::EC2::EIP
+    Condition: CreateEip
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Domain: vpc
+      Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-eip"}]
+
+  EipAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !If [CreateEip, !GetAtt ElasticIp.AllocationId, !Ref ExistingElasticIp]
+      InstanceId: !Ref Instance
+
+Outputs:
+  PublicIp:
+    Description: >
+      Point your domain's A record here. Reuse this address via ExistingElasticIp on future deploys
+      so a stack replacement cannot change it.
+    Value: !If [CreateEip, !Ref ElasticIp, !Ref ExistingElasticIp]
+  McpUrl:
+    Description: MCP endpoint. With a domain, available once DNS resolves and the cert is issued.
+    Value: !If [HasDomain, !Sub "https://${Domain}/mcp", "http://<PublicIp>/mcp"]
+  AddToClaudeCode:
+    Description: Run this on each teammate's machine.
+    Value: !If
+      - HasDomain
+      - !Sub "claude mcp add --transport http discord-index https://${Domain}/mcp -H \"Authorization: Bearer <McpAuthToken>\""
+      - "claude mcp add --transport http discord-index http://<PublicIp>/mcp -H \"Authorization: Bearer <McpAuthToken>\""
+  FirstBackfill:
+    Description: Run once after DNS is live to build the initial index.
+    Value: !Sub "aws ssm start-session --target ${Instance} --region ${AWS::Region}  # then: cd /opt/discord-index && docker compose run --rm sync node dist/cli.js sync --full"
