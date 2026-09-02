@@ -1,267 +1,176 @@
 # discord-index
 
-Searchable index over a Discord server, exposed to Claude as MCP tools.
+Search your team's Discord the way you'd ask a colleague, from inside Claude.
 
-Discord's message-search endpoint is closed to bots, so no MCP server that queries the Discord API
-live can offer real search: the ceiling is 100 messages per call, one channel at a time. This project
-keeps a local index instead. It fetches messages itself, ranks them with SQLite FTS5 + OpenAI
-embeddings, and serves four MCP tools.
+```
+you:  what did we decide about switching the queue backend?
+
+→  #engineering, 14 Mar
+   ada:   redis is dropping jobs under load, we lose ~2% on spikes
+   grace: SQS then? we already pay for it
+   ada:   yes, and it gives us the retry semantics for free
+   (+ the surrounding messages, with jump links)
+```
+
+Not a keyword grep. Ask in your own words and it finds the conversation, even
+when none of your words appear in it.
+
+## Why this exists
+
+Discord's message-search endpoint is **closed to bots**. Every MCP server that
+queries the Discord API live is stuck at 100 messages per call, one channel at a
+time — fine for "read me the last few messages in #general", useless for "where
+did we discuss this".
+
+So this keeps its own index. It fetches your history once, stores it in SQLite,
+and searches locally:
 
 ```
 Discord API ──▶ SQLite (FTS5 + embeddings) ──▶ MCP ──▶ Claude
 ```
 
-## MCP tools
+On a real 59k-message server, a query takes well under a second.
 
-| Tool | Purpose |
+## What makes the answers useful
+
+**It returns conversations, not matching lines.** A hit that says
+*"actually the rewrite broke staging"* is worthless without what came before it.
+Each result is assembled from Discord's own structure, in order of how reliable
+that structure is:
+
+1. **Reply chains** — Discord states them outright, so they survive any time gap.
+   A reply three days later is still the same conversation.
+2. **The whole thread**, when the hit is in one.
+3. **Time-adjacent messages**, because most people just post the next message
+   without hitting reply.
+
+Hits from the same discussion are merged into one result, and every message is
+tagged `matched: true/false` so the model can tell the hit from its context.
+
+**Hybrid ranking.** SQLite FTS5/BM25 finds exact strings — error text, ticket
+ids, library names. Embeddings find meaning: *"someone was unhappy about waiting
+too long"* surfaces a complaint about load times with no shared words. The two
+rankings are fused with Reciprocal Rank Fusion, so BM25 scores and cosine
+distances never have to be put on a common scale.
+
+**Stale answers announce themselves.** Every result carries a freshness block,
+and a lagging index says so instead of quietly answering from old data.
+
+## Four tools
+
+| Tool | What it does |
 |---|---|
-| `search_messages` | Hybrid keyword + semantic search. Returns conversation **windows**, not isolated messages, each with jump URLs. |
-| `get_context` | Messages before/after a given message id — for reading around a hit. |
-| `list_channels` | Indexed channels with message counts and last activity. |
-| `sync_status` | Totals, embedding coverage, freshness, and the last sync run (including its error). |
+| `search_messages` | Hybrid search. Returns conversations with jump URLs. `context: wide` for "the whole discussion". |
+| `get_context` | Messages around a given id, for reading further. |
+| `list_channels` | What's indexed, with message counts. |
+| `sync_status` | Totals, embedding coverage, freshness, last run and its error. |
 
-## Setup
+## Quick start
+
+You need a Discord bot with **View Channels** + **Read Message History** and the
+**Message Content** intent enabled. That intent is not optional: without it the
+API returns history with empty `content`.
 
 ```bash
 pnpm install
-cp .env.example .env           # fill in DISCORD_TOKEN + DISCORD_GUILD_ID
+cp .env.example .env      # DISCORD_TOKEN, DISCORD_GUILD_ID, OPENAI_API_KEY
 pnpm build
-node dist/cli.js sync --since 2026-06-01   # bounded first backfill; drop --since for all history
+node dist/cli.js sync --since 2026-06-01   # bounded first backfill
+claude mcp add discord-index -- node $PWD/dist/cli.js serve
 ```
 
-The Discord bot needs **View Channels + Read Message History and nothing else**, plus the
-Message Content intent in the developer portal. It only ever sees channels it has been granted access to.
-
-Register with Claude Code:
+No bot token handy? See it work on example data first:
 
 ```bash
-claude mcp add discord-index -- node /absolute/path/to/discord-index/dist/cli.js serve
+pnpm seed && pnpm smoke
 ```
-
-## How it works
-
-**Windows.** Messages are grouped into conversation windows that break on a 30-minute silence, 50
-messages, or 4000 characters. Windows are the unit of retrieval: they give the embedding real
-conversational context and keep the vector count ~50x lower than per-message embedding, which is what
-makes brute-force cosine viable without a vector database.
-
-**Hybrid ranking.** FTS5/BM25 finds exact strings (error text, ticket ids, library names); embeddings
-find concepts. The two rankings are combined with Reciprocal Rank Fusion, so BM25 and cosine never
-have to be put on a common scale. `mode: "keyword"` or `"semantic"` forces one side.
-
-**Incremental sync.** The cursor is a Discord snowflake, so a quiet channel costs exactly one
-request per run. An unchanged open window keeps its embedding across syncs (matched by content
-hash), so an idle server costs zero embedding calls.
-
-**Freshness is explicit.** Every search result carries a `freshness` block, and a stale index says so
-in a `warning` rather than quietly answering from old data. `sync` hard-fails if any message ends up
-without a window, because such a message would be silently unsearchable.
-
-## Operating
-
-```bash
-node dist/cli.js sync                      # incremental: only messages newer than the watermark
-node dist/cli.js sync --since 2026-06-01   # bounded backfill (cheap first run)
-node dist/cli.js sync --full               # re-fetch all history
-node dist/cli.js reindex                   # rebuild windows + embeddings from stored messages,
-                                           # no Discord calls (use after changing WINDOW_GAP_MINUTES)
-node dist/cli.js sync --seed ./fixture     # index local example data, no token needed
-node dist/cli.js status
-node dist/cli.js search "database migration" --mode hybrid --channel engineering
-```
-
-**Messages are fetched once and stored permanently.** An incremental sync only asks for messages
-newer than the watermark, so existing ones are never re-fetched — which is why `reindex` can change
-the windowing rules without touching Discord, re-billing only the embeddings.
-
-**Run `sync --full` weekly.** The incremental cursor filters on message id, so it never revisits an
-old message that was edited or notices one that was deleted. The weekly full pass repairs both.
-
-**Cadence.** All channels share ONE Discord rate-limit bucket (measured: 5 requests/second), so a
-full incremental pass is roughly one request per channel at ~4 req/s. `SYNC_INTERVAL_SECONDS`
-defaults to 300; the interval is measured from the END of the previous run, so runs never overlap.
-
-**Keep `INCLUDE_THREADS=Active`.** `All` also lists archived threads, which costs one extra request
-per parent channel on every run for content that never changes. Use it for a one-off backfill, then
-switch back.
-
-**Embedding cost.** `text-embedding-3-small` at $0.02/1M tokens. A 200k-message backfill is roughly
-6M tokens (~$0.12); steady-state incremental syncs are a fraction of a cent. Without `OPENAI_API_KEY`
-everything still works keyword-only, and says so in the result `notes`.
 
 ## Deploying for a team
 
-The HTTP transport requires a bearer token — **the server refuses to start without one**, so there is
-no way to accidentally publish your archive unauthenticated. stdio needs no token.
-
-### One-click on AWS
-
-[`deploy/aws/cloudformation.yaml`](deploy/aws/cloudformation.yaml) provisions one EC2 instance (Graviton,
-Ubuntu 24.04), an encrypted gp3 volume, an Elastic IP, a security group open only on 80/443, and Caddy
-for automatic HTTPS. SSH is closed by default — shell access is via SSM Session Manager.
+**Anywhere with Docker** — the MCP server, a sync loop, and Caddy for TLS:
 
 ```bash
-aws cloudformation deploy \
-  --template-file deploy/aws/cloudformation.yaml \
-  --stack-name discord-index \
-  --capabilities CAPABILITY_IAM \
-  --parameter-overrides \
-      VpcId=vpc-xxx SubnetId=subnet-xxx \
-      Domain=discord-mcp.example.com \
-      DiscordToken=... DiscordGuildId=... \
-      McpAuthToken="$(openssl rand -hex 32)" \
-      OpenAiApiKey=...
-```
-
-Then point your domain's A record at the `PublicIp` in the stack Outputs. Caddy issues the certificate
-on first request. The stack only reports success once `/healthz` answers, so a broken boot rolls back
-with a reason instead of hanging.
-
-Build the first index:
-
-```bash
-aws ssm start-session --target <instance-id>
-cd /opt/discord-index && docker compose run --rm sync node dist/cli.js sync --full
-```
-
-### Anywhere else
-
-```bash
-cp .env.example .env    # set DISCORD_TOKEN, DISCORD_GUILD_ID, MCP_AUTH_TOKEN, DOMAIN
 docker compose up -d --build
 ```
 
-Three services: the MCP server, a sync loop (`SYNC_INTERVAL_SECONDS`, default 300), and Caddy.
+**On AWS** — [`deploy/aws/cloudformation.yaml`](deploy/aws/cloudformation.yaml)
+provisions a Graviton instance, encrypted volume, Elastic IP, and automatic
+HTTPS. Secrets go to Secrets Manager, never into user-data.
 
-### Hardening
+Either way, the HTTP transport **requires a bearer token and refuses to start
+without one**, so there's no way to accidentally publish your archive.
 
-What the stack does and does not protect:
-
-| | |
-|---|---|
-| SSH | **Closed by default** — no ingress rule unless you set `AllowedSshCidr`. Shell access is SSM Session Manager. `fail2ban` is installed to guard `sshd` if you do open it. |
-| MCP endpoint | Bearer token, plus a per-IP limiter: 300 req/min, and 10 failed auths in 5 minutes locks the IP out for the rest of the window (`429` + `Retry-After`). Rejections are logged with the client IP. |
-| Network | 443 is restricted to `AllowedMcpCidr` or, behind a CDN, to `AllowedPrefixListId` holding the CDN's ranges — otherwise anyone who finds the origin IP bypasses the CDN entirely. Port 80 stays open because Let's Encrypt validates from its own servers, not the CDN; it serves only the ACME challenge and a redirect. |
-| OS | `unattended-upgrades` enabled at boot. |
-| Secrets | Held in Secrets Manager and fetched at boot by the instance role — **never written into user-data**, which any process on the box can read via IMDS and which persists for the life of the instance. |
-| Metadata | IMDSv2 required (`HttpTokens: required`) with `HttpPutResponseHopLimit: 1`, so an SSRF in the app cannot reach user-data or the role credentials. |
-| Container | Runs as the unprivileged `node` user, not root. |
-| Disk | Root volume encrypted. |
-
-The limiter is not credential defence — a 256-bit token is not brute-forceable. It bounds runaway
-clients and caps the damage from a token that leaks into a shell history or a committed config. If a
-token does leak, redeploy with a new `McpAuthToken`; there is no revocation list.
-
-Behind a proxy the limiter keys on `X-Forwarded-For`, which is client-controlled — so set
-`TRUST_PROXY=false` if you ever expose the server directly instead of through the bundled Caddy.
-
-### Role-scoped access
-
-A single shared token cannot express "cofounders only" — the server sees one identity for every
-caller. Give each role its own token instead:
-
-Rules match the Discord **category/channel ID** as well as the name — prefer IDs, because a category
-renamed in Discord silently stops matching a name rule and quietly widens access:
-
-```yaml
-exclude:
-  categories: ["000000000000000000"]   # never indexed at all
-
-roles:
-  - name: team
-    tokenEnv: MCP_TOKEN_TEAM
-    denyCategories: ["000000000000000000"]
-  - name: marketing
-    tokenEnv: MCP_TOKEN_MARKETING
-    allowCategories: [Growth, Product]
-  - name: cofounder
-    tokenEnv: MCP_TOKEN_COFOUNDER
+```bash
+claude mcp add --transport http discord-index https://your.host/mcp \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
-Policy lives in a YAML (or JSON) file that `POLICY_FILE` points at — see
-[`policy.example.yaml`](policy.example.yaml). It contains **no secrets**: tokens are referenced by
-environment variable name (`tokenEnv`), so the file is meant to be committed and reviewed, while the
-tokens come from your secret store. Without `POLICY_FILE`, `MCP_AUTH_TOKEN` is a single full-access role.
+## Controlling who sees what
 
-A role whose `tokenEnv` is unset **aborts startup** rather than silently denying that role — or, far
-worse, silently allowing it. The sync process reads only the `exclude:` block and never resolves
-tokens, so it does not need any role's credentials.
-
-Scoping is applied **inside the SQL of every tool**, never as a post-filter, so a denied channel
-cannot leak through a code path that forgot to filter. That covers the non-obvious paths too:
-`get_context` on a known message id in a denied channel returns "not in the index" — identical to a
-message that does not exist, so the error itself reveals nothing — and `sync_status` counts are
-scoped, because totals over channels you cannot read still leak their size.
-
-### Tiers: separate databases, one endpoint
-
-A tier is a group of categories stored in **its own database file**. A channel lives in exactly one
-tier, so nothing is duplicated. A role lists the tiers it may read, and tiers it may not read are
-**never opened** — so a forgotten filter in a future query cannot leak them, because the data is not
-in any file that process has open.
+Policy lives in a YAML file that holds **no secrets** — tokens are referenced by
+environment variable name, so it belongs in version control where changes to
+who-can-read-what get reviewed like code.
 
 ```yaml
 tiers:
-  - name: cofounder
-    categories: ["000000000000000000"]
+  - name: leadership
+    categories: ["1234567890"]     # Discord category id
 
 roles:
   - name: team
     tokenEnv: MCP_TOKEN_TEAM
-    tiers: [common]                 # cofounder database never opened
-  - name: cofounder
-    tokenEnv: MCP_TOKEN_COFOUNDER
-    tiers: [common, cofounder]      # one search, both tiers, fused
+    tiers: [common]                # leadership database is never opened
+  - name: leadership
+    tokenEnv: MCP_TOKEN_LEADERSHIP
+    tiers: [common, leadership]    # one search, both tiers, fused
 ```
 
-Multi-tier roles are still **one MCP endpoint and one search**: each tier is queried with the same
-SQL and contributes its own ranking, and Reciprocal Rank Fusion merges them — so BM25 scores computed
-over different corpora are never compared, only ranks.
+Each tier is a **separate database file**. A role that can't read a tier never
+opens it, so a forgotten filter in some future query can't leak it — the data
+isn't in any file that process has open. Within a tier, `denyCategories` and
+`allowCategories` narrow further, enforced in the SQL of every tool rather than
+as a post-filter.
 
-### Two layers, for two different questions
+Rules match Discord **IDs** as well as names. Prefer IDs: renaming a category
+silently stops a name rule from matching, which quietly widens access.
+
+Two layers, for two different questions:
 
 | | |
 |---|---|
-| `EXCLUDE_CATEGORIES` / `EXCLUDE_CHANNELS` | **Never indexed.** The content is not in the database at all, so no role, no misconfiguration, and nobody reading the file can reach it. Use for anything that must not be stored. |
-| Role `denyCategories` / `allowCategories` | **Indexed but filtered per caller.** Use when some roles legitimately need the content and others must not see it. |
+| `exclude:` | **Never indexed.** Not in any database, so nothing can reach it. Adding a rule also purges what was already stored. |
+| Role tiers / deny | **Indexed but filtered per caller.** For content some roles legitimately need. |
 
-Excluding at index time is strictly stronger; role scoping is what lets cofounders search their own
-channels while nobody else can.
+## Costs and limits
 
-### Audit log
+**Embeddings** are the only paid part: `text-embedding-3-small` at $0.02/1M
+tokens. A 59k-message backfill is roughly **$0.11**. Incremental syncs re-embed
+only what changed, so a quiet cycle costs nothing. Without `OPENAI_API_KEY`
+everything still works, keyword-only, and says so in the results.
 
-Every tool call is logged as JSON to stderr (collected by journald / `docker logs`), and to
-`AUDIT_LOG_PATH` if set: timestamp, tool, role, client IP, arguments, result count, and any error.
+**Rate limits.** Every channel shares one Discord bucket — measured at 5
+requests/second — so concurrency hides latency but cannot raise the ceiling. A
+full incremental pass is about one request per channel. Sync runs on a loop with
+the interval measured from the end of the previous run, so runs never overlap,
+and a single-writer lock covers manual runs and container restarts.
 
-With a shared team token this attributes to a **role, not a person**. If you need to know *who* ran a
-query, each person needs their own token.
+**Scale.** Semantic search scores every window vector in memory, cached per
+process. Comfortable to roughly 50k windows (~2.5M messages); past that, move the
+vectors to sqlite-vec or pgvector.
 
-### Teammates connect with
+**Deletions** are only reconciled by `sync --full`. Run it weekly.
 
-```bash
-claude mcp add --transport http discord-index https://discord-mcp.example.com/mcp \
-  -H "Authorization: Bearer <token>"
-```
+**Node 24+.** `better-sqlite3` aborts with no output on an older ABI, so the CLI
+refuses to start below 24. Some version managers hand `pnpm run` a different Node
+than the one you installed with — if a script fails the check, call
+`node dist/cli.js` directly.
 
-Add `-s project` to write a `.mcp.json` your repo can commit, configuring everyone at once.
+## Ideas, bugs, "why does it do that"
 
-> **A shared index flattens Discord's per-channel permissions.** The bearer token authenticates *who*,
-> but every holder can then search everything the bot indexed. Scope the bot's role to channels the
-> whole team may read before sharing the endpoint, and verify with `node dist/cli.js channels`.
+Open an issue, or find me at **[@0xnick__](https://x.com/0xnick__)**. Genuinely
+interested in what breaks and what's missing — especially from anyone running it
+against a server shaped differently from ours.
 
-## Tests
+## License
 
-```bash
-pnpm seed     # example channels indexed locally, no Discord token needed
-pnpm smoke    # drives all four tools over real MCP stdio
-```
-
-## Limits
-
-- **Brute-force vector search.** Every window embedding is scanned per semantic query. Fine to roughly
-  50k windows (~2.5M messages); past that, move the vectors to sqlite-vec or pgvector.
-- **Deletions** are only caught by `sync --full`.
-- **Node 24+ required.** `better-sqlite3` is a native module that aborts the process with no output on
-  an older ABI, so `cli.js` refuses to start below Node 24. Note that some version managers hand
-  `pnpm run` / `npm run` a *different* Node than the one you installed with — if a `pnpm <script>` fails
-  the version check, invoke `node dist/cli.js ...` directly.
+MIT.
