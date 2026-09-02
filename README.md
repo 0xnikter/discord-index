@@ -128,9 +128,18 @@ pnpm install && pnpm build && pnpm seed && pnpm smoke
 
 ```bash
 cp .env.example .env
-# Required, or Caddy serves plain HTTP and your token crosses the wire in clear:
-echo 'SITE_ADDRESS=mcp.your-domain.com' >> .env
-echo "MCP_AUTH_TOKEN=$(openssl rand -hex 32)" >> .env
+openssl rand -hex 32          # paste into MCP_AUTH_TOKEN=
+```
+
+Then **edit** `.env` and set two values — edit them in place, don't append, or
+you end up with two copies of the same key and tools disagree about which wins:
+
+| | |
+|---|---|
+| `SITE_ADDRESS` | your hostname, e.g. `mcp.your-domain.com`. Leave it empty and Caddy serves **plain HTTP** and your token crosses the wire in clear. |
+| `MCP_AUTH_TOKEN` | the value you just generated. The server refuses to start over HTTP without it. |
+
+```bash
 docker compose up -d --build
 ```
 
